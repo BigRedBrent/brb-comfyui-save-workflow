@@ -94,8 +94,8 @@ class SaveWorkflow:
                 }),
             },
             "optional": {
-                "anything": (ANY, {
-                    "tooltip": "Any value, sent out unchanged through passthrough. The node waits for it before "
+                "passthrough": (ANY, {
+                    "tooltip": "Any value, sent out unchanged through the passthrough output. The node waits for it before "
                                "saving, so wire it from a saver to save after the file is saved.",
                 }),
                 "path": (ANY, {
@@ -120,8 +120,8 @@ class SaveWorkflow:
     DESCRIPTION = "Saves the workflow as a .json file, such as next to a video, so it can be opened again later."
 
     def save(self, extension, always_add_counter, api_format_only, format,
-             anything=None, path=None, prompt=None, extra_pnginfo=None):
-        result = {"result": (anything,)}
+             passthrough=None, path=None, prompt=None, extra_pnginfo=None):
+        result = {"result": (passthrough,)}
 
         if api_format_only:
             data = prompt
