@@ -1,0 +1,12 @@
+[project]
+name = "brb-comfyui-save-workflow"
+version = "1.0.0"
+description = "A ComfyUI node that saves the workflow as a .json file."
+license = { file = "LICENSE" }
+
+[project.urls]
+Repository = "https://github.com/BigRedBrent/brb-comfyui-save-workflow"
+
+[tool.comfy]
+PublisherId = "bigredbrent"
+DisplayName = "Save Workflow"
