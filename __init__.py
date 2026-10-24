@@ -1,6 +1,10 @@
 import json
 import os
 import re
+import time
+import zipfile
+
+WEB_DIRECTORY = "."
 
 LOG_PREFIX = "[Save Workflow]"
 
@@ -9,6 +13,9 @@ DEFAULT_NAME = "workflow"
 
 # Number of digits in the counter added to file names, like ComfyUI's own savers: "_00001".
 COUNTER_DIGITS = 5
+
+# Choices for the wildcard backup's compression: "none", then zip's levels from 1 (fastest) to 9 (smallest).
+ZIP_COMPRESSION_CHOICES = ["none"] + [str(level) for level in range(1, 10)]
 
 
 class AnyType(str):
@@ -67,6 +74,56 @@ def next_number(base, extension):
     return highest + 1
 
 
+def comfyui_folder():
+    try:
+        import folder_paths
+
+        return folder_paths.base_path
+    except Exception:
+        return os.getcwd()
+
+
+def zip_path_for(json_path, ending):
+    # The backup zip has the same name as the workflow file, with .zip in place of its ending.
+    if ending and json_path.endswith(ending):
+        return json_path[: -len(ending)] + ".zip"
+    return json_path + ".zip"
+
+
+def write_wildcard_backup(zip_path, folder, compression, overwrite=False):
+    # Saves every file in the folder and its subfolders into a zip, sorted by name, each with its own date.
+    # Sorting and keeping the dates means an unchanged file is stored exactly the same in every backup.
+    files = []
+    for dirpath, dirnames, filenames in os.walk(folder):
+        for file_name in filenames:
+            full_path = os.path.join(dirpath, file_name)
+            files.append((os.path.relpath(full_path, folder).replace(os.sep, "/"), full_path))
+    files.sort()
+    if not files:
+        print(f"{LOG_PREFIX} The wildcards folder is empty, so no backup was saved: {folder}")
+        return
+
+    uncompressed = compression == "none"
+    method = zipfile.ZIP_STORED if uncompressed else zipfile.ZIP_DEFLATED
+    try:
+        # "xb" never overwrites an existing file; "wb" replaces it, only when overwrite is on.
+        with open(zip_path, "wb" if overwrite else "xb") as zip_file, zipfile.ZipFile(zip_file, "w") as archive:
+            for name, full_path in files:
+                modified = time.localtime(os.stat(full_path).st_mtime)
+                date = max(tuple(modified[:6]), (1980, 1, 1, 0, 0, 0))
+                info = zipfile.ZipInfo(name, date_time=date)
+                info.compress_type = method
+                info.external_attr = 0o644 << 16
+                with open(full_path, "rb") as source:
+                    if uncompressed:
+                        archive.writestr(info, source.read())
+                    else:
+                        archive.writestr(info, source.read(), compresslevel=int(compression))
+        print(f"{LOG_PREFIX} Saved wildcard backup: {zip_path}")
+    except OSError as error:
+        print(f"{LOG_PREFIX} Couldn't save the wildcard backup {zip_path}: {error}")
+
+
 class SaveWorkflow:
     @classmethod
     def INPUT_TYPES(cls):
@@ -91,6 +148,30 @@ class SaveWorkflow:
                 "format": (["compact", "readable"], {
                     "default": "compact",
                     "tooltip": "compact: smallest file. readable: indented, for reading in a text editor.",
+                }),
+                "backup_wildcards": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Also saves a zip of the wildcards folder next to the workflow file, with the same "
+                               "name, so you know exactly which wildcard files a result was made with.",
+                }),
+                "zip_compression": (ZIP_COMPRESSION_CHOICES, {
+                    "default": "9",
+                    "tooltip": "How much the wildcard backup is compressed: 1 is fastest, 9 is smallest. \"none\" "
+                               "stores the files without compression. Each zip is larger, but if you keep many backups "
+                               "in an archive that stores only differences, such as Git, uncompressed zips take up "
+                               "far less space overall.",
+                }),
+                "wildcards_folder": ("STRING", {
+                    "default": "wildcards",
+                    "tooltip": "The folder to back up. A name like \"wildcards\" is inside the ComfyUI folder, "
+                               "which is where Dynamic Prompts keeps its wildcards. A full path works too.",
+                }),
+                # Added last, so workflows saved with earlier versions keep their other settings in place.
+                "overwrite": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Saves to the exact same name every time, replacing the file (and wildcard backup) "
+                               "if it already exists. No number is ever added. Turning this on turns off "
+                               "always_add_counter, and the other way around. Off: existing files are never replaced.",
                 }),
             },
             "optional": {
@@ -120,6 +201,7 @@ class SaveWorkflow:
     DESCRIPTION = "Saves the workflow as a .json file, such as next to a video, so it can be opened again later."
 
     def save(self, extension, always_add_counter, api_format_only, format,
+             backup_wildcards=False, zip_compression="9", wildcards_folder="wildcards", overwrite=False,
              passthrough=None, path=None, prompt=None, extra_pnginfo=None):
         result = {"result": (passthrough,)}
 
@@ -167,12 +249,26 @@ class SaveWorkflow:
         else:
             text = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
-        candidate = None if always_add_counter else base + ending
+        if overwrite:
+            # Always the exact name, replacing any file already there.
+            candidate = base + ending
+            try:
+                with open(candidate, "w", encoding="utf-8") as json_file:
+                    json_file.write(text)
+            except OSError as error:
+                print(f"{LOG_PREFIX} Couldn't save {candidate}: {error}")
+                return result
+        else:
+            candidate = None if always_add_counter else base + ending
         number = None
-        while True:
+        while not overwrite:
             if candidate is None:
                 number = next_number(base, ending) if number is None else number + 1
                 candidate = numbered_path(base, ending, number)
+            if backup_wildcards and os.path.exists(zip_path_for(candidate, ending)):
+                # The backup must get the same name, so a name whose zip is taken counts as taken too.
+                candidate = None
+                continue
             try:
                 # "x" never overwrites: it fails if the file already exists, and a number is tried instead.
                 with open(candidate, "x", encoding="utf-8") as json_file:
@@ -185,6 +281,15 @@ class SaveWorkflow:
                 return result
 
         print(f"{LOG_PREFIX} Saved: {candidate}")
+
+        if backup_wildcards:
+            source = str(wildcards_folder or "").strip().strip('"').strip().replace("\\", "/")
+            if not os.path.isabs(source):
+                source = os.path.join(comfyui_folder(), source)
+            if os.path.isdir(source):
+                write_wildcard_backup(zip_path_for(candidate, ending), source, zip_compression, overwrite)
+            else:
+                print(f"{LOG_PREFIX} The wildcards folder doesn't exist, so no backup was saved: {source}")
         return result
 
 
@@ -196,4 +301,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "BRBSaveWorkflow": "Save Workflow",
 }
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+__all__ = ["WEB_DIRECTORY", "NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

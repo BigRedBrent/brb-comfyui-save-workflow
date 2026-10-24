@@ -2,7 +2,7 @@
 
 A ComfyUI node that saves the workflow as a .json file, so you can open the exact workflow that made a result. It's made for savers that don't store the workflow themselves, like most video savers: wire the saver's file path into it, and the workflow is saved next to the file with the same name, like `my_clip_00007.mp4` and `my_clip_00007.json`. Drag the .json file into ComfyUI to open the workflow again.
 
-It never overwrites a file. If the name is already taken, it adds a number like `_00001`.
+Unless **overwrite** is on, it never replaces a file. If the name is already taken, it adds a number like `_00001`.
 
 ## Inputs
 
@@ -12,3 +12,7 @@ It never overwrites a file. If the name is already taken, it adds a number like 
 - **always_add_counter:** always adds a number like `_00001`, even when the name isn't taken.
 - **api_format_only:** saves only the node settings used to run the job, without the layout, groups or notes.
 - **format:** `compact` for the smallest file, or `readable` to open in a text editor.
+- **backup_wildcards:** also saves a zip of the wildcards folder next to the workflow file, with the same name, like `my_clip_00007.zip`. That way you know exactly which wildcard files a result was made with.
+- **zip_compression:** how much the wildcard backup is compressed, from 1 (fastest) to 9 (smallest, the default). `none` stores the files without compression. Each zip is larger, but if you keep many backups in an archive that stores only differences, such as Git, uncompressed zips take up far less space overall.
+- **wildcards_folder:** the folder to back up. `wildcards` means the one inside the ComfyUI folder, where Dynamic Prompts keeps its wildcards. A full path works too.
+- **overwrite:** saves to the exact same name every time, replacing the file and its wildcard backup if they already exist. No number is ever added. Turning it on turns off **always_add_counter**, and the other way around. Useful when another program picks up the file after each job. Off by default, so existing files are never replaced.
