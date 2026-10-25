@@ -99,9 +99,20 @@ function addTextBox(node, name, text) {
     }
 }
 
+function textsOf(node) {
+    // The text shown in the boxes. It's kept in the node's saved data, so it survives undo and redo, and
+    // comes back when the workflow is opened again. The next run replaces it.
+    node.properties = node.properties || {};
+    const texts = node.properties.saved_text;
+    if (!texts || typeof texts !== "object" || Array.isArray(texts)) {
+        node.properties.saved_text = {};
+    }
+    return node.properties.saved_text;
+}
+
 function updateTextBoxes(node) {
     // Shows a box for each text input that's connected or has text, in order, and none for the others.
-    node.savedText = node.savedText || {};
+    node.savedText = textsOf(node);
     const wanted = [];
     for (let number = 1; number <= TEXT_INPUTS; number++) {
         const name = `text_${number}`;
@@ -254,13 +265,7 @@ app.registerExtension({
                 setByName(this, values);
             }
 
-            // A workflow file saved by this node carries the text inputs' text; show it. It's then removed from
-            // the node, so it isn't saved again with the workflow and mistaken for newer text later.
-            const savedText = this.properties?.saved_text;
-            this.savedText = savedText && typeof savedText === "object" ? { ...savedText } : {};
-            if (this.properties && "saved_text" in this.properties) {
-                delete this.properties.saved_text;
-            }
+            // Show the text kept with the node, such as from a workflow file this node saved.
             setTimeout(() => updateTextBoxes(this), 0);
             return result;
         };
@@ -273,8 +278,8 @@ app.registerExtension({
             if (!app.configuringGraph) {
                 const isInput = type === (window.LiteGraph?.INPUT ?? 1);
                 const input = isInput ? this.inputs?.[slot] : null;
-                if (!connected && input?.name?.startsWith("text_") && this.savedText) {
-                    delete this.savedText[input.name];
+                if (!connected && input?.name?.startsWith("text_")) {
+                    delete textsOf(this)[input.name];
                 }
                 setTimeout(() => updateTextBoxes(this), 0);
             }
@@ -294,7 +299,8 @@ app.registerExtension({
             const result = onExecuted?.apply(this, arguments);
             const received = Array.isArray(message?.saved_text) ? message.saved_text[0] : message?.saved_text;
             if (received && typeof received === "object") {
-                this.savedText = { ...received };
+                this.properties = this.properties || {};
+                this.properties.saved_text = { ...received };
                 updateTextBoxes(this);
             }
             return result;
