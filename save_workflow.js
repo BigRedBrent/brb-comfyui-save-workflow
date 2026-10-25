@@ -1,10 +1,13 @@
 import { app } from "../../scripts/app.js";
+import { ComfyWidgets } from "../../scripts/widgets.js";
 
 // Page-side tweaks for the Save Workflow node:
 // - "overwrite" is shown right below "always_add_counter", and a gap separates "format" from the wildcard
 //   backup settings.
 // - Turning "overwrite" or "always_add_counter" on turns the other off, since they do opposite things.
 // - Settings are saved by name, so changing the order of the settings can never mix up their values.
+// - Each text input that's connected, or has text from an opened workflow file, gets a read-only box at the
+//   bottom showing its text. The box is labeled like its input, so renaming an input renames its box.
 
 const NODE_TYPE = "BRBSaveWorkflow";
 
@@ -26,8 +29,121 @@ function findWidget(node, name) {
     return (node.widgets || []).find((widget) => widget.name === name) || null;
 }
 
+// How many text inputs the node has (TEXT_INPUTS in __init__.py), and the names of their boxes.
+const TEXT_INPUTS = 3;
+const BOX_PREFIX = "text_box_";
+
+// Multi-line boxes don't show their label, so a small title is shown above each one, like Last Preview Text's.
+const TITLE_PREFIX = "text_title_";
+const TITLE_HEIGHT = 20;
+
+function isTextWidget(widget) {
+    return !!widget?.name && (widget.name.startsWith(BOX_PREFIX) || widget.name.startsWith(TITLE_PREFIX));
+}
+
 function isSetting(widget) {
-    return !!widget?.name && widget.type !== "gap" && widget.type !== "button";
+    return !!widget?.name && widget.type !== "gap" && widget.type !== "button" && !isTextWidget(widget);
+}
+
+function inputLabel(node, name) {
+    const input = (node.inputs || []).find((item) => item.name === name);
+    return input?.label || name;
+}
+
+function addTitle(node, name) {
+    const element = document.createElement("div");
+    element.textContent = inputLabel(node, name);
+    Object.assign(element.style, {
+        boxSizing: "border-box",
+        width: "100%",
+        height: `${TITLE_HEIGHT}px`,
+        lineHeight: `${TITLE_HEIGHT}px`,
+        padding: "0 4px",
+        fontSize: "11px",
+        opacity: "0.75",
+        color: "var(--input-text, #ddd)",
+        whiteSpace: "nowrap",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        pointerEvents: "none",
+        userSelect: "none",
+    });
+    const widget = node.addDOMWidget(TITLE_PREFIX + name, "save_workflow_title", element, {
+        serialize: false,
+        hideInPanel: true,
+        getMinHeight: () => TITLE_HEIGHT,
+        getMaxHeight: () => TITLE_HEIGHT,
+    });
+    widget.serialize = false;
+    widget.titleElement = element;
+}
+
+function addTextBox(node, name, text) {
+    addTitle(node, name);
+    const widget = ComfyWidgets.STRING(
+        node,
+        BOX_PREFIX + name,
+        ["STRING", { multiline: true, default: "", placeholder: `Shows the text wired into ${name}…` }],
+        app
+    ).widget;
+    widget.label = inputLabel(node, name);
+    widget.options = widget.options || {};
+    widget.options.read_only = true;
+    widget.options.serialize = false;
+    widget.serialize = false;
+    widget.value = text;
+    // "element" is the current name; "inputEl" is only for older ComfyUI versions.
+    const textBox = widget.element ?? widget.inputEl;
+    if (textBox) {
+        textBox.readOnly = true;
+    }
+}
+
+function updateTextBoxes(node) {
+    // Shows a box for each text input that's connected or has text, in order, and none for the others.
+    node.savedText = node.savedText || {};
+    const wanted = [];
+    for (let number = 1; number <= TEXT_INPUTS; number++) {
+        const name = `text_${number}`;
+        const input = (node.inputs || []).find((item) => item.name === name);
+        if (input?.link != null || typeof node.savedText[name] === "string") {
+            wanted.push(name);
+        }
+    }
+    const shown = (node.widgets || []).filter((widget) => widget.name?.startsWith(BOX_PREFIX)).map((widget) => widget.name);
+    const same = shown.length === wanted.length && shown.every((name, index) => name === BOX_PREFIX + wanted[index]);
+    if (same) {
+        for (const name of wanted) {
+            const widget = findWidget(node, BOX_PREFIX + name);
+            widget.value = node.savedText[name] ?? "";
+        }
+    } else {
+        for (const widget of [...(node.widgets || [])]) {
+            if (isTextWidget(widget)) {
+                node.removeWidget(widget);
+            }
+        }
+        for (const name of wanted) {
+            addTextBox(node, name, node.savedText[name] ?? "");
+        }
+        const size = node.computeSize?.();
+        if (size) {
+            node.setSize([node.size[0], size[1]]);
+        }
+    }
+    node.setDirtyCanvas?.(true, true);
+}
+
+function syncBoxLabels(node) {
+    // Keeps each box's title the same as its input's label, after an input is renamed.
+    for (const widget of node.widgets || []) {
+        if (widget.name?.startsWith(TITLE_PREFIX) && widget.titleElement) {
+            const label = inputLabel(node, widget.name.slice(TITLE_PREFIX.length));
+            if (widget.titleElement.textContent !== label) {
+                widget.titleElement.textContent = label;
+            }
+        }
+    }
 }
 
 function moveAfter(node, name, afterName) {
@@ -100,6 +216,7 @@ app.registerExtension({
             moveAfter(this, "overwrite", "always_add_counter");
             insertGapAfter(this, "format");
             linkToggles(this, "overwrite", "always_add_counter");
+            updateTextBoxes(this);
             const size = this.computeSize?.();
             if (size) {
                 this.setSize([Math.max(this.size[0], size[0]), Math.max(this.size[1], size[1])]);
@@ -135,6 +252,50 @@ app.registerExtension({
                     values[name] = info.widgets_values[index];
                 });
                 setByName(this, values);
+            }
+
+            // A workflow file saved by this node carries the text inputs' text; show it. It's then removed from
+            // the node, so it isn't saved again with the workflow and mistaken for newer text later.
+            const savedText = this.properties?.saved_text;
+            this.savedText = savedText && typeof savedText === "object" ? { ...savedText } : {};
+            if (this.properties && "saved_text" in this.properties) {
+                delete this.properties.saved_text;
+            }
+            setTimeout(() => updateTextBoxes(this), 0);
+            return result;
+        };
+
+        // Adds or removes boxes as text inputs are connected or disconnected. Disconnecting an input also
+        // clears its text, so its box goes away.
+        const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+        nodeType.prototype.onConnectionsChange = function (type, slot, connected) {
+            const result = onConnectionsChange?.apply(this, arguments);
+            if (!app.configuringGraph) {
+                const isInput = type === (window.LiteGraph?.INPUT ?? 1);
+                const input = isInput ? this.inputs?.[slot] : null;
+                if (!connected && input?.name?.startsWith("text_") && this.savedText) {
+                    delete this.savedText[input.name];
+                }
+                setTimeout(() => updateTextBoxes(this), 0);
+            }
+            return result;
+        };
+
+        const onDrawForeground = nodeType.prototype.onDrawForeground;
+        nodeType.prototype.onDrawForeground = function () {
+            const result = onDrawForeground?.apply(this, arguments);
+            syncBoxLabels(this);
+            return result;
+        };
+
+        // Shows the text from the latest run.
+        const onExecuted = nodeType.prototype.onExecuted;
+        nodeType.prototype.onExecuted = function (message) {
+            const result = onExecuted?.apply(this, arguments);
+            const received = Array.isArray(message?.saved_text) ? message.saved_text[0] : message?.saved_text;
+            if (received && typeof received === "object") {
+                this.savedText = { ...received };
+                updateTextBoxes(this);
             }
             return result;
         };

@@ -11,6 +11,9 @@ LOG_PREFIX = "[Save Workflow]"
 # File name used when nothing usable is wired into path. It's saved in ComfyUI's output folder.
 DEFAULT_NAME = "workflow"
 
+# How many text inputs the node has, each shown in its own box and saved in the workflow file.
+TEXT_INPUTS = 3
+
 # Number of digits in the counter added to file names, like ComfyUI's own savers: "_00001".
 COUNTER_DIGITS = 5
 
@@ -46,6 +49,50 @@ def last_text(value):
             found = last_text(item)
             if found:
                 return found
+    return None
+
+
+def to_text(value):
+    # Turns any value into text, the same way Last Preview Text does.
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if value is None:
+        return "None"
+    try:
+        return json.dumps(value, indent=4, ensure_ascii=False)
+    except Exception:
+        try:
+            return str(value)
+        except Exception:
+            return "The input exists, but couldn't be turned into text."
+
+
+def find_workflow_node(workflow, unique_id):
+    # This node's entry in the saved workflow, including inside subgraphs (ids like "12:5").
+    if not isinstance(workflow, dict):
+        return None
+    definitions = {}
+    pending = [workflow]
+    while pending:
+        container = pending.pop()
+        for definition in ((container.get("definitions") or {}).get("subgraphs") or []):
+            if isinstance(definition, dict) and definition.get("id") and str(definition["id"]) not in definitions:
+                definitions[str(definition["id"])] = definition
+                pending.append(definition)
+    nodes = workflow.get("nodes") or []
+    ids = str(unique_id).split(":")
+    for index, node_id in enumerate(ids):
+        node = next((n for n in nodes if isinstance(n, dict) and str(n.get("id")) == node_id), None)
+        if node is None:
+            return None
+        if index == len(ids) - 1:
+            return node
+        definition = definitions.get(str(node.get("type")))
+        if definition is None:
+            return None
+        nodes = definition.get("nodes") or []
     return None
 
 
@@ -186,10 +233,20 @@ class SaveWorkflow:
                                "Video Combine's Filenames output, uses the last file in it. If path isn't connected, "
                                "the file is saved as \"workflow\" in the output folder.",
                 }),
+                **{
+                    f"text_{number}": (ANY, {
+                        "tooltip": "Any value, turned into text, such as a positive or negative prompt. It's shown "
+                                   "on this node and saved in the workflow file, so opening that file in ComfyUI "
+                                   "shows it here again. Right-click the input to give it a label, like "
+                                   "\"positive\". Left out when nothing is connected, or when api_format_only is on.",
+                    })
+                    for number in range(1, TEXT_INPUTS + 1)
+                },
             },
             "hidden": {
                 "prompt": "PROMPT",
                 "extra_pnginfo": "EXTRA_PNGINFO",
+                "unique_id": "UNIQUE_ID",
             },
         }
 
@@ -202,8 +259,17 @@ class SaveWorkflow:
 
     def save(self, extension, always_add_counter, api_format_only, format,
              backup_wildcards=False, zip_compression="9", wildcards_folder="wildcards", overwrite=False,
-             passthrough=None, path=None, prompt=None, extra_pnginfo=None):
+             passthrough=None, path=None, prompt=None, extra_pnginfo=None, unique_id=None, **texts):
         result = {"result": (passthrough,)}
+        # The text inputs that are connected, turned into text: {"text_1": "...", ...}
+        saved_text = {}
+        for number in range(1, TEXT_INPUTS + 1):
+            name = f"text_{number}"
+            if texts.get(name) is not None:
+                saved_text[name] = to_text(texts[name])
+        if saved_text:
+            # Shown on the node (see save_workflow.js).
+            result["ui"] = {"saved_text": [saved_text]}
 
         if api_format_only:
             data = prompt
@@ -212,6 +278,16 @@ class SaveWorkflow:
         if data is None:
             print(f"{LOG_PREFIX} Nothing to save (the job wasn't queued from the ComfyUI page)")
             return result
+
+        if saved_text and not api_format_only:
+            # Saved in this node's entry in the file only. The job's own copy of the workflow is shared with
+            # every other node in the job, so it's copied first and left unchanged.
+            data = json.loads(json.dumps(data))
+            entry = find_workflow_node(data, unique_id or "")
+            if entry is not None:
+                properties = entry.setdefault("properties", {})
+                if isinstance(properties, dict):
+                    properties["saved_text"] = saved_text
 
         # The name comes only from path. If path isn't connected or has no name in it, use the default name.
         target = last_text(path)

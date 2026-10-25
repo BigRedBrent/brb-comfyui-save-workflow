@@ -1,6 +1,6 @@
 [project]
 name = "brb-comfyui-save-workflow"
-version = "1.1.0"
+version = "1.2.0"
 description = "A ComfyUI node that saves the workflow as a .json file."
 license = { file = "LICENSE" }
 
