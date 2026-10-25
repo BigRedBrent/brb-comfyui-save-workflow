@@ -23,6 +23,7 @@ const NEWER_DEFAULTS = {
     zip_compression: "9",
     wildcards_folder: "wildcards",
     overwrite: false,
+    keep_text: false,
 };
 
 function findWidget(node, name) {
@@ -99,15 +100,44 @@ function addTextBox(node, name, text) {
     }
 }
 
+function keepsText(node) {
+    return findWidget(node, "keep_text")?.value !== false;
+}
+
 function textsOf(node) {
-    // The text shown in the boxes. It's kept in the node's saved data, so it survives undo and redo, and
-    // comes back when the workflow is opened again. The next run replaces it.
+    // The text shown in the boxes. With keep_text on, it's kept in the node's saved data, so it survives
+    // undo and redo, and comes back when the workflow is opened again. With keep_text off, it's only held
+    // while the page is open. Either way, the next run replaces it.
     node.properties = node.properties || {};
+    if (!keepsText(node)) {
+        node.shownText = node.shownText || {};
+        return node.shownText;
+    }
     const texts = node.properties.saved_text;
     if (!texts || typeof texts !== "object" || Array.isArray(texts)) {
         node.properties.saved_text = {};
     }
     return node.properties.saved_text;
+}
+
+function setTexts(node, texts) {
+    node.properties = node.properties || {};
+    if (keepsText(node)) {
+        node.properties.saved_text = { ...texts };
+    } else {
+        node.shownText = { ...texts };
+        delete node.properties.saved_text;
+    }
+}
+
+function applyKeepText(node) {
+    // Moves the shown text to wherever keep_text says it belongs.
+    node.properties = node.properties || {};
+    const current = node.properties.saved_text || node.shownText || {};
+    setTexts(node, current);
+    if (keepsText(node)) {
+        node.shownText = null;
+    }
 }
 
 function updateTextBoxes(node) {
@@ -227,6 +257,17 @@ app.registerExtension({
             moveAfter(this, "overwrite", "always_add_counter");
             insertGapAfter(this, "format");
             linkToggles(this, "overwrite", "always_add_counter");
+            moveAfter(this, "keep_text", "wildcards_folder");
+            insertGapAfter(this, "wildcards_folder");
+            const keepText = findWidget(this, "keep_text");
+            if (keepText) {
+                const callback = keepText.callback;
+                keepText.callback = (...args) => {
+                    const result = callback?.apply(keepText, args);
+                    applyKeepText(this);
+                    return result;
+                };
+            }
             updateTextBoxes(this);
             const size = this.computeSize?.();
             if (size) {
@@ -265,7 +306,9 @@ app.registerExtension({
                 setByName(this, values);
             }
 
-            // Show the text kept with the node, such as from a workflow file this node saved.
+            // Show the text kept with the node, such as from a workflow file this node saved. With keep_text
+            // off, the text from the file is still shown, but not kept.
+            applyKeepText(this);
             setTimeout(() => updateTextBoxes(this), 0);
             return result;
         };
@@ -299,8 +342,7 @@ app.registerExtension({
             const result = onExecuted?.apply(this, arguments);
             const received = Array.isArray(message?.saved_text) ? message.saved_text[0] : message?.saved_text;
             if (received && typeof received === "object") {
-                this.properties = this.properties || {};
-                this.properties.saved_text = { ...received };
+                setTexts(this, received);
                 updateTextBoxes(this);
             }
             return result;

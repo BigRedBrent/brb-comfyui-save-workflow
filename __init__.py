@@ -220,6 +220,14 @@ class SaveWorkflow:
                                "if it already exists. No number is ever added. Turning this on turns off "
                                "always_add_counter, and the other way around. Off: existing files are never replaced.",
                 }),
+                # Added last, so workflows saved with earlier versions keep their other settings in place.
+                "keep_text": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "On: the text shown in the text boxes is kept with this workflow, so it survives "
+                               "undo and comes back when the workflow is opened again. Off: the text is only "
+                               "shown, not kept, so it's lost on undo or reopening. The saved workflow file always "
+                               "gets the text either way.",
+                }),
             },
             "optional": {
                 "passthrough": (ANY, {
@@ -259,6 +267,7 @@ class SaveWorkflow:
 
     def save(self, extension, always_add_counter, api_format_only, format,
              backup_wildcards=False, zip_compression="9", wildcards_folder="wildcards", overwrite=False,
+             keep_text=False,
              passthrough=None, path=None, prompt=None, extra_pnginfo=None, unique_id=None, **texts):
         result = {"result": (passthrough,)}
         # The text inputs that are connected, turned into text: {"text_1": "...", ...}
