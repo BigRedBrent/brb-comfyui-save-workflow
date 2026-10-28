@@ -30,6 +30,12 @@ class AnyType(str):
 ANY = AnyType("*")
 
 
+def reason(error):
+    # Why something failed, like "Permission denied", without the file's path or name. Paths and names come from
+    # the node's settings, which can be private, so they're never written to the log.
+    return getattr(error, "strerror", None) or type(error).__name__
+
+
 def output_folder():
     try:
         import folder_paths
@@ -147,7 +153,7 @@ def write_wildcard_backup(zip_path, folder, compression, overwrite=False):
             files.append((os.path.relpath(full_path, folder).replace(os.sep, "/"), full_path))
     files.sort()
     if not files:
-        print(f"{LOG_PREFIX} The wildcards folder is empty, so no backup was saved: {folder}")
+        print(f"{LOG_PREFIX} The wildcards folder is empty, so no backup was saved")
         return
 
     uncompressed = compression == "none"
@@ -166,9 +172,9 @@ def write_wildcard_backup(zip_path, folder, compression, overwrite=False):
                         archive.writestr(info, source.read())
                     else:
                         archive.writestr(info, source.read(), compresslevel=int(compression))
-        print(f"{LOG_PREFIX} Saved wildcard backup: {zip_path}")
+        print(f"{LOG_PREFIX} Saved the wildcard backup")
     except OSError as error:
-        print(f"{LOG_PREFIX} Couldn't save the wildcard backup {zip_path}: {error}")
+        print(f"{LOG_PREFIX} Couldn't save the wildcard backup: {reason(error)}")
 
 
 class SaveWorkflow:
@@ -326,7 +332,7 @@ class SaveWorkflow:
         try:
             os.makedirs(folder, exist_ok=True)
         except OSError as error:
-            print(f"{LOG_PREFIX} Couldn't create the folder {folder}: {error}")
+            print(f"{LOG_PREFIX} Couldn't create the folder to save in: {reason(error)}")
             return result
 
         if format == "readable":
@@ -341,7 +347,7 @@ class SaveWorkflow:
                 with open(candidate, "w", encoding="utf-8") as json_file:
                     json_file.write(text)
             except OSError as error:
-                print(f"{LOG_PREFIX} Couldn't save {candidate}: {error}")
+                print(f"{LOG_PREFIX} Couldn't save the workflow: {reason(error)}")
                 return result
         else:
             candidate = None if always_add_counter else base + ending
@@ -362,10 +368,10 @@ class SaveWorkflow:
             except FileExistsError:
                 candidate = None
             except OSError as error:
-                print(f"{LOG_PREFIX} Couldn't save {candidate}: {error}")
+                print(f"{LOG_PREFIX} Couldn't save the workflow: {reason(error)}")
                 return result
 
-        print(f"{LOG_PREFIX} Saved: {candidate}")
+        print(f"{LOG_PREFIX} Saved the workflow")
 
         if backup_wildcards:
             source = str(wildcards_folder or "").strip().strip('"').strip().replace("\\", "/")
@@ -374,7 +380,7 @@ class SaveWorkflow:
             if os.path.isdir(source):
                 write_wildcard_backup(zip_path_for(candidate, ending), source, zip_compression, overwrite)
             else:
-                print(f"{LOG_PREFIX} The wildcards folder doesn't exist, so no backup was saved: {source}")
+                print(f"{LOG_PREFIX} The wildcards folder doesn't exist, so no backup was saved")
         return result
 
 
