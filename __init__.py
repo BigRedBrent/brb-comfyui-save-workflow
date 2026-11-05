@@ -1,8 +1,13 @@
+import asyncio
 import json
 import os
 import re
+import threading
 import time
+import uuid
 import zipfile
+
+from . import save_workflow as archiving
 
 WEB_DIRECTORY = "."
 
@@ -177,6 +182,507 @@ def write_wildcard_backup(zip_path, folder, compression, overwrite=False):
         print(f"{LOG_PREFIX} Couldn't save the wildcard backup: {reason(error)}")
 
 
+def wildcards_source(wildcards_folder):
+    source = str(wildcards_folder or "").strip().strip('"').strip().replace("\\", "/")
+    if not os.path.isabs(source):
+        source = os.path.join(comfyui_folder(), source)
+    return source
+
+
+# Archiving.
+
+def archive_folder_for(archive_path):
+    # A name or relative path is inside the output folder; a full path is used as is.
+    path = str(archive_path or "").strip().strip('"').strip().replace("\\", "/") or ".workflows"
+    if not os.path.isabs(path):
+        path = os.path.join(output_folder(), path)
+    return os.path.normpath(path)
+
+
+def failed_list_file():
+    # The list of folders holding files from failed saves, in ComfyUI's user folder.
+    try:
+        import folder_paths
+
+        user = folder_paths.get_user_directory()
+    except Exception:
+        user = os.path.join(comfyui_folder(), "user")
+    return os.path.join(user, "brb_save_workflow", "failed_archiving.json")
+
+
+def send_to_page(event, data):
+    # Messages for the page, shown in pop-ups there. They may name paths, since nothing is kept: they're never
+    # written to the log or the browser's console.
+    try:
+        from server import PromptServer
+
+        PromptServer.instance.send_sync(event, data)
+    except Exception:
+        pass
+
+
+class NodeProgress:
+    # The node's progress bar, with a line of text saying what it's doing where ComfyUI supports it. Each step
+    # starts a new bar.
+    STEPS = 1000
+
+    def __init__(self, node_id):
+        self.node_id = node_id
+        self.bar = None
+        self.text = None
+
+    def show(self, text, fraction):
+        # fraction is None for steps with no real progress to show, like compressing, which Git doesn't report:
+        # then only the text is shown, with no bar.
+        try:
+            import comfy.utils
+
+            if text != self.text:
+                if fraction is not None and (
+                    self.bar is None or text.split(" ")[0] != (self.text or "").split(" ")[0]
+                ):
+                    self.bar = comfy.utils.ProgressBar(self.STEPS, node_id=self.node_id)
+                self.text = text
+                try:
+                    from server import PromptServer
+
+                    if hasattr(PromptServer.instance, "send_progress_text"):
+                        PromptServer.instance.send_progress_text(text, self.node_id)
+                except Exception:
+                    pass
+            if fraction is None:
+                self.bar = None
+            else:
+                self.bar.update_absolute(int(max(0.0, min(fraction, 1.0)) * self.STEPS), self.STEPS)
+        except Exception:
+            # Including a canceled job: archiving is always finished, so the archive is never left half done.
+            pass
+
+
+# Folders already checked for files left from failed saves since ComfyUI started.
+_checked_folders = set()
+_checked_lock = threading.Lock()
+
+# The Workflow Extractor, copied next to each archive when it's created, and updated when the node loads.
+EXTRACTOR_NAME = ".workflow_extractor.pyw"
+EXTRACTOR_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), EXTRACTOR_NAME)
+
+
+def numbered_name(name, ending, number):
+    return f"{name}_{number:0{COUNTER_DIGITS}d}{ending}"
+
+
+def pick_archive_name(base, ending, taken, always_add_counter, with_zip):
+    # The file name for a save into the archive. A name counts as taken if it's already in the archive or waiting
+    # in the folder to be stored, and a number like _00001 is added the same way as on disk: one more than the
+    # highest number used with that name.
+    name = os.path.basename(base)
+
+    def free(file_name):
+        return file_name not in taken and (not with_zip or zip_path_for(file_name, ending) not in taken)
+
+    if not always_add_counter and free(name + ending):
+        return name + ending
+    pattern = re.compile(re.escape(name) + r"_(\d{" + str(COUNTER_DIGITS) + r"})" + re.escape(ending) + r"$")
+    highest = 0
+    for file_name in taken:
+        match = pattern.match(file_name)
+        if match:
+            highest = max(highest, int(match.group(1)))
+    number = highest + 1
+    while not free(numbered_name(name, ending, number)):
+        number += 1
+    return numbered_name(name, ending, number)
+
+
+def store_leftovers(archive, folder, output, progress):
+    # Stores files left from failed saves (or renamed to end in .archive) from every folder on the list for this
+    # archive, and from this save's folder on its first save since ComfyUI started.
+    list_file = failed_list_file()
+    folders = archiving.failed_folders(list_file, archive, output)
+    key = os.path.normcase(os.path.realpath(folder))
+    with _checked_lock:
+        if key not in _checked_folders:
+            _checked_folders.add(key)
+            folders.append(folder)
+    found = []
+    seen = set()
+    for each in folders:
+        each_key = os.path.normcase(os.path.realpath(each))
+        if each_key in seen:
+            continue
+        seen.add(each_key)
+        try:
+            found += archiving.leftovers_in(each)
+        except OSError:
+            pass
+    if found:
+        archiving.store_files(
+            archive, output, found, "Stored files left from failed saves",
+            lambda text, fraction: progress.show(text, fraction), "Storing left over",
+        )
+        print(f"{LOG_PREFIX} Stored {len(found)} file(s) left from failed saves")
+    for each in folders:
+        archiving.update_failed_folder(list_file, each, archive, output)
+
+
+def place_extractor(archive, only_update=False):
+    # Copies the Workflow Extractor next to the archive, replacing a copy that isn't exactly the same as this
+    # add-on's. With only_update, used when the node loads, a missing copy isn't added.
+    target = os.path.join(os.path.dirname(archive), EXTRACTOR_NAME)
+    temp = None
+    try:
+        if only_update and not os.path.isfile(target):
+            return
+        with open(EXTRACTOR_SOURCE, "rb") as file:
+            data = file.read()
+        if os.path.isfile(target):
+            with open(target, "rb") as file:
+                if file.read() == data:
+                    return
+        # Written under a temporary name first, so a copy is never left half written.
+        temp = f"{target}.{uuid.uuid4().hex}.tmp"
+        with open(temp, "xb") as file:
+            file.write(data)
+        os.replace(temp, target)
+        temp = None
+        print(f"{LOG_PREFIX} Copied the Workflow Extractor next to the archive")
+        return True
+    except Exception:
+        print(f"{LOG_PREFIX} Couldn't copy the Workflow Extractor next to the archive")
+    finally:
+        if temp is not None:
+            try:
+                os.remove(temp)
+            except OSError:
+                pass
+
+
+def save_failed(started, folder, json_name, text, zip_data, archive, output, error):
+    # Archiving failed, so the files are saved to their folder instead, named the way they'd be stored, with
+    # .archive added, like "2026-11-03_10-21-05 my_clip_00001.json.archive". They're stored later by retry_failed or
+    # the Retry Failed Archive button.
+    day, clock = archiving.stamp_parts(started)
+    ending = os.path.splitext(json_name)[1]
+    saved = False
+    try:
+        os.makedirs(folder, exist_ok=True)
+        name = json_name
+        stem = os.path.splitext(json_name)[0]
+        while True:
+            json_path = os.path.join(folder, f"{day}_{clock} {name}{archiving.LEFTOVER_ENDING}")
+            zip_name = zip_path_for(name, ending)
+            zip_path = os.path.join(folder, f"{day}_{clock} {zip_name}{archiving.LEFTOVER_ENDING}")
+            if not os.path.exists(json_path) and (zip_data is None or not os.path.exists(zip_path)):
+                break
+            # Saved in the same second with the same name: try the next number.
+            match = re.match(r"(.*)_(\d{" + str(COUNTER_DIGITS) + r"})$", stem)
+            stem = f"{match.group(1)}_{int(match.group(2)) + 1:0{COUNTER_DIGITS}d}" if match else f"{stem}_00001"
+            name = stem + ending
+        with open(json_path, "xb") as file:
+            file.write(text.encode("utf-8"))
+        if zip_data is not None:
+            with open(zip_path, "xb") as file:
+                file.write(zip_data)
+        saved = True
+        archiving.add_failed_folder(failed_list_file(), folder, archive, output)
+    except OSError as write_error:
+        print(f"{LOG_PREFIX} Couldn't save the workflow to its folder either: {reason(write_error)}")
+    if saved:
+        print(f"{LOG_PREFIX} Archiving failed, so the workflow was saved to its folder instead, ending in .archive")
+    send_to_page("brb.save_workflow.archive_failed", {
+        "reason": str(error) if isinstance(error, archiving.ArchiveError) else f"{type(error).__name__}: {error}",
+        "folder": folder if saved else None,
+    })
+
+
+def archive_save(started, base, ending, text, always_add_counter, backup_wildcards, wildcards_folder, archive_path,
+                 compress_every, retry_failed, compress_in_background, unique_id):
+    output = output_folder()
+    archive = archive_folder_for(archive_path)
+    folder = os.path.dirname(base)
+    progress = NodeProgress(unique_id)
+    progress.show("Archiving", 0.0)
+    zip_data = None
+    if backup_wildcards:
+        source = wildcards_source(wildcards_folder)
+        if os.path.isdir(source):
+            try:
+                zip_data = archiving.wildcard_zip(source, "none")
+            except OSError as error:
+                print(f"{LOG_PREFIX} Couldn't read the wildcards folder: {reason(error)}")
+            if zip_data is None:
+                print(f"{LOG_PREFIX} The wildcards folder is empty, so no backup was saved")
+        else:
+            print(f"{LOG_PREFIX} The wildcards folder doesn't exist, so no backup was saved")
+
+    json_name = os.path.basename(base) + ending
+    try:
+        created = not archiving.is_marked_archive(archive)
+        archiving.open_archive(archive)
+        if created:
+            place_extractor(archive)
+        if retry_failed:
+            store_leftovers(archive, folder, output, progress)
+        parts = archiving.folder_parts(folder, output)
+        day, clock = archiving.stamp_parts(started)
+        reader = archiving.Reader(archive)
+        try:
+            taken = archiving.names_in_folder(archive, parts, reader) | archiving.leftover_names(folder)
+            json_name = pick_archive_name(base, ending, taken, always_add_counter, zip_data is not None)
+            items = [archiving.Item(parts, day, clock, json_name, text.encode("utf-8"))]
+            if zip_data is not None:
+                items.append(archiving.Item(parts, day, clock, zip_path_for(json_name, ending), zip_data))
+            progress.show("Archiving", 0.5)
+            count = archiving.store(archive, items, reader=reader)
+        finally:
+            reader.close()
+        progress.show("Archiving", 1.0)
+    except Exception as error:
+        if not isinstance(error, archiving.ArchiveError):
+            print(f"{LOG_PREFIX} Archiving failed: {type(error).__name__}")
+        save_failed(started, folder, json_name, text, zip_data, archive, output, error)
+        return
+    print(f"{LOG_PREFIX} Archived the workflow")
+
+    if compress_every and count >= compress_every:
+        if compress_in_background:
+            threading.Thread(target=compress_archive, args=(archive, None), daemon=True).start()
+        else:
+            compress_archive(archive, progress)
+
+
+def compress_archive(archive, progress):
+    started = time.time()
+    try:
+        ran = archiving.compress(
+            archive, (lambda text, fraction: progress.show(text, fraction)) if progress else None
+        )
+    except Exception as error:
+        print(f"{LOG_PREFIX} Compressing the archive failed. It'll be tried again on the next save")
+        send_to_page("brb.save_workflow.archive_problem", {
+            "text": f"Compressing the archive failed, so it'll be tried again on the next save.\n\n{error}",
+        })
+        return
+    if ran:
+        print(f"{LOG_PREFIX} Compressed the archive in {time.time() - started:.0f} second(s)")
+
+
+# The node's buttons, which run on the server, in the background, while the page shows their progress.
+
+_tasks = {}
+_tasks_lock = threading.Lock()
+
+
+def run_task(action, archive):
+    output = output_folder()
+    task = {
+        "text": "Starting...", "fraction": None, "done": False, "error": None, "result": None, "archive": archive,
+        "abort": False, "aborted": False, "status": None, "thread": None,
+    }
+    should_stop = lambda: task["abort"]
+
+    def progress(text, fraction):
+        task["text"] = text
+        task["fraction"] = fraction
+
+    def watch():
+        # Once a second, checks whether the task's own work (storing files, looking for them) is using the
+        # processor: "working", or "not responding" after a few seconds without. Git's own steps report theirs in
+        # their message instead.
+        try:
+            import psutil
+
+            me = psutil.Process()
+        except Exception:
+            return
+        last_cpu = None
+        last_active = time.time()
+        while not task["done"]:
+            try:
+                thread = next((each for each in me.threads() if each.id == task["thread"]), None)
+                cpu = thread.user_time + thread.system_time if thread else None
+            except Exception:
+                cpu = None
+            now = time.time()
+            if cpu is not None:
+                if last_cpu is None or cpu > last_cpu + 0.01:
+                    last_active = now
+                last_cpu = cpu
+                task["status"] = "working" if now - last_active < archiving.IDLE_AFTER else "not responding"
+            time.sleep(1.0)
+
+    def work():
+        task["thread"] = threading.get_native_id()
+        try:
+            if action == "rebuild":
+                size_before = archiving.archive_size(archive)
+                rebuild_started = time.time()
+                if not archiving.compress(archive, progress, rebuild=True, should_stop=should_stop):
+                    raise archiving.ArchiveError(
+                        "The archive is being compressed right now. Try again once that's done."
+                    )
+                size_after = archiving.archive_size(archive)
+                task["result"] = (
+                    "The archive was rebuilt and checked, and everything in it is intact.\n\n"
+                    f"Time to rebuild: {archiving.duration(time.time() - rebuild_started)}\n\n"
+                    f"Archive size before rebuild: {archiving.size_text(size_before)}\n"
+                    f"Archive size after rebuild: {archiving.size_text(size_after)}"
+                )
+                return
+            list_file = failed_list_file()
+            listed = archiving.failed_folders(list_file, archive, output)
+            progress("Looking for files...", None)
+            found = archiving.find_all(output, archive, include_regular=(action == "archive_all"), extra_folders=listed)
+            if not found:
+                task["result"] = (
+                    "No workflows or wildcard backups were found to archive." if action == "archive_all"
+                    else "No files ending in .archive were found, so there was nothing to retry."
+                )
+                return
+            message = "Archived existing files" if action == "archive_all" else "Stored files left from failed saves"
+            stored, identical, unreadable = archiving.store_files(
+                archive, output, found, message,
+                progress,
+                "Archiving" if action == "archive_all" else "Storing",
+                should_stop,
+            )
+            for folder in listed:
+                archiving.update_failed_folder(list_file, folder, archive, output)
+            lines = [f"Stored {stored:,} file(s) in the archive."]
+            if identical:
+                lines.append(f"{identical:,} were already stored exactly the same, so they were just removed from "
+                             "their folders.")
+            if unreadable:
+                lines.append(f"{unreadable:,} couldn't be read, so they were left where they are.")
+            if action == "archive_all":
+                archiving.compress(archive, progress, should_stop=should_stop)
+                lines.append("The archive was compressed afterward.")
+            task["result"] = "\n".join(lines)
+            print(f"{LOG_PREFIX} Stored {stored + identical} file(s) in the archive from the node's button")
+        except archiving.Stopped:
+            task["aborted"] = True
+        except Exception as error:
+            task["error"] = str(error) if isinstance(error, archiving.ArchiveError) else f"{type(error).__name__}: {error}"
+        finally:
+            task["fraction"] = 1.0
+            task["done"] = True
+
+    task_id = uuid.uuid4().hex
+    with _tasks_lock:
+        _tasks[task_id] = task
+    threading.Thread(target=work, daemon=True).start()
+    threading.Thread(target=watch, daemon=True).start()
+    return task_id
+
+
+def create_archive_now(archive):
+    # The Create Archive button: creates a new, empty archive, only where there isn't one or anything else already.
+    try:
+        archiving.check_git()
+        if archiving.is_marked_archive(archive):
+            # Puts the Workflow Extractor back if it was deleted, or updates it.
+            if place_extractor(archive):
+                return {"result": (
+                    f"An archive already exists at:\n{archive}\n\n"
+                    "The Workflow Extractor was copied next to it."
+                )}
+            return {"result": f"An archive already exists at:\n{archive}\n\nNothing was changed."}
+        if os.path.exists(archive) and (not os.path.isdir(archive) or os.listdir(archive)):
+            return {"error": (
+                f"That folder already has other files in it, so an archive can't be created there:\n{archive}\n\n"
+                "Either remove the existing folder, or choose a different location in the archive_path setting."
+            )}
+        archiving.create_archive(archive)
+    except archiving.ArchiveError as error:
+        return {"error": str(error)}
+    except OSError as error:
+        return {"error": f"Couldn't create the archive ({error.strerror or error}):\n{archive}"}
+    print(f"{LOG_PREFIX} Created a new archive")
+    place_extractor(archive)
+    return {"result": f"Created a new archive at:\n{archive}"}
+
+
+def add_routes():
+    try:
+        from aiohttp import web
+        from server import PromptServer
+
+        routes = PromptServer.instance.routes
+    except Exception:
+        return
+
+    @routes.post("/brb_save_workflow/task")
+    async def start_task(request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        action = data.get("action")
+        if action not in ("create", "retry_failed", "archive_all", "rebuild"):
+            return web.json_response({"error": "Unknown action."})
+        archive = archive_folder_for(data.get("archive_path"))
+        if action == "create":
+            return web.json_response(create_archive_now(archive))
+        with _tasks_lock:
+            busy = any(
+                not task["done"] and archiving.archive_key(task["archive"]) == archiving.archive_key(archive)
+                for task in _tasks.values()
+            )
+        if busy:
+            return web.json_response({"error": "Another task is still running on this archive. Try again once it's done."})
+        try:
+            archiving.open_archive(archive, create=False)
+        except archiving.ArchiveError as error:
+            return web.json_response({"error": str(error)})
+        return web.json_response({"task": run_task(action, archive)})
+
+    @routes.post("/brb_save_workflow/update_extractor")
+    async def update_extractor(request):
+        # Sent once by the page when the node loads: updates the Workflow Extractor next to a valid archive, if it's
+        # already there.
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        archive = archive_folder_for(data.get("archive_path"))
+
+        def update():
+            try:
+                if archiving.is_marked_archive(archive):
+                    place_extractor(archive, only_update=True)
+            except Exception:
+                pass
+
+        await asyncio.to_thread(update)
+        return web.json_response({"ok": True})
+
+    @routes.get("/brb_save_workflow/task/{task_id}")
+    async def task_status(request):
+        with _tasks_lock:
+            task = _tasks.get(request.match_info["task_id"])
+            if task is None:
+                return web.json_response({"error": "This task is no longer known.", "done": True})
+            if task["done"]:
+                # Each finished task is only reported once.
+                _tasks.pop(request.match_info["task_id"], None)
+        return web.json_response(
+            {key: task[key] for key in ("text", "fraction", "done", "error", "result", "aborted", "status")}
+        )
+
+    @routes.post("/brb_save_workflow/task/{task_id}/abort")
+    async def abort_task(request):
+        # The task stops as soon as it safely can; the page waits for it to report that it's done.
+        with _tasks_lock:
+            task = _tasks.get(request.match_info["task_id"])
+            if task is not None:
+                task["abort"] = True
+        return web.json_response({"ok": task is not None})
+
+
+add_routes()
+
+
 class SaveWorkflow:
     @classmethod
     def INPUT_TYPES(cls):
@@ -234,6 +740,43 @@ class SaveWorkflow:
                                "shown, not kept, so it's lost on undo or reopening. The saved workflow file always "
                                "gets the text either way.",
                 }),
+                # The archive settings, added last, so workflows saved with earlier versions keep their other
+                # settings in place.
+                "archive": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Saves the workflow (and wildcard backup) into an archive instead of the folder, where "
+                               "similar files take up far less space. Find and extract them with the Workflow "
+                               "Extractor, from this add-on's GitHub page. While on, zip_compression and overwrite "
+                               "are ignored: wildcard backups are stored uncompressed, and files are never "
+                               "overwritten. Requires Git.",
+                }),
+                "archive_path": ("STRING", {
+                    "default": ".workflows",
+                    "tooltip": "Where the archive is. A name or relative path, like .workflows, is inside ComfyUI's "
+                               "output folder. A full path is used as is. It's created on the first save if it doesn't "
+                               "exist. An existing folder is only used if it's empty or already an archive.",
+                }),
+                "compress_every": ("INT", {
+                    "default": 1000,
+                    "min": 0,
+                    "max": 1000000,
+                    "step": 1,
+                    "tooltip": "How many saves between compressions of the archive. Until then, new saves take up "
+                               "more space. 0 means never: the archive is never compressed and keeps growing.",
+                }),
+                "retry_failed": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "If archiving ever fails, the files are saved to their folder instead, with .archive "
+                               "added to their names. With this on, they're stored in the archive on later saves. "
+                               "Files you rename yourself to end in .archive, like my_clip.json.archive, are picked "
+                               "up too, on the first save to their folder after ComfyUI starts.",
+                }),
+                "compress_in_background": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Off: when it's time to compress the archive, the job pauses until it's done, so the "
+                               "compression doesn't compete with jobs for memory. On: it compresses alongside your "
+                               "jobs instead.",
+                }),
             },
             "optional": {
                 "passthrough": (ANY, {
@@ -273,8 +816,11 @@ class SaveWorkflow:
 
     def save(self, extension, always_add_counter, api_format_only, format,
              backup_wildcards=False, zip_compression="9", wildcards_folder="wildcards", overwrite=False,
-             keep_text=False,
+             keep_text=False, archive=False, archive_path=".workflows", compress_every=1000, retry_failed=True,
+             compress_in_background=False,
              passthrough=None, path=None, prompt=None, extra_pnginfo=None, unique_id=None, **texts):
+        # The time of this save, taken first, before anything else is done.
+        started = time.time()
         result = {"result": (passthrough,)}
         # The text inputs that are connected, turned into text: {"text_1": "...", ...}
         saved_text = {}
@@ -329,16 +875,26 @@ class SaveWorkflow:
             ending = ""
 
         folder = os.path.dirname(base)
-        try:
-            os.makedirs(folder, exist_ok=True)
-        except OSError as error:
-            print(f"{LOG_PREFIX} Couldn't create the folder to save in: {reason(error)}")
-            return result
 
         if format == "readable":
             text = json.dumps(data, ensure_ascii=False, indent=2)
         else:
             text = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+        if archive:
+            # zip_compression and overwrite are ignored while archiving: zips are stored uncompressed, and nothing
+            # is ever overwritten.
+            archive_save(
+                started, base, ending, text, always_add_counter, backup_wildcards, wildcards_folder, archive_path,
+                compress_every, retry_failed, compress_in_background, unique_id,
+            )
+            return result
+
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as error:
+            print(f"{LOG_PREFIX} Couldn't create the folder to save in: {reason(error)}")
+            return result
 
         if overwrite:
             # Always the exact name, replacing any file already there.
@@ -374,9 +930,7 @@ class SaveWorkflow:
         print(f"{LOG_PREFIX} Saved the workflow")
 
         if backup_wildcards:
-            source = str(wildcards_folder or "").strip().strip('"').strip().replace("\\", "/")
-            if not os.path.isabs(source):
-                source = os.path.join(comfyui_folder(), source)
+            source = wildcards_source(wildcards_folder)
             if os.path.isdir(source):
                 write_wildcard_backup(zip_path_for(candidate, ending), source, zip_compression, overwrite)
             else:
