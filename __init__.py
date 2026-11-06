@@ -148,38 +148,341 @@ def zip_path_for(json_path, ending):
     return json_path + ".zip"
 
 
-def write_wildcard_backup(zip_path, folder, compression, overwrite=False):
-    # Saves every file in the folder and its subfolders into a zip, sorted by name, each with its own date.
-    # Sorting and keeping the dates means an unchanged file is stored exactly the same in every backup.
-    files = []
-    for dirpath, dirnames, filenames in os.walk(folder):
-        for file_name in filenames:
-            full_path = os.path.join(dirpath, file_name)
-            files.append((os.path.relpath(full_path, folder).replace(os.sep, "/"), full_path))
-    files.sort()
-    if not files:
-        print(f"{LOG_PREFIX} The wildcards folder is empty, so no backup was saved")
-        return
-
-    uncompressed = compression == "none"
-    method = zipfile.ZIP_STORED if uncompressed else zipfile.ZIP_DEFLATED
+def write_wildcard_backup(zip_path, data, overwrite=False):
+    # Saves the wildcard backup's zip. Returns True if it was saved.
     try:
         # "xb" never overwrites an existing file; "wb" replaces it, only when overwrite is on.
-        with open(zip_path, "wb" if overwrite else "xb") as zip_file, zipfile.ZipFile(zip_file, "w") as archive:
-            for name, full_path in files:
-                modified = time.localtime(os.stat(full_path).st_mtime)
-                date = max(tuple(modified[:6]), (1980, 1, 1, 0, 0, 0))
-                info = zipfile.ZipInfo(name, date_time=date)
-                info.compress_type = method
-                info.external_attr = 0o644 << 16
-                with open(full_path, "rb") as source:
-                    if uncompressed:
-                        archive.writestr(info, source.read())
-                    else:
-                        archive.writestr(info, source.read(), compresslevel=int(compression))
+        with open(zip_path, "wb" if overwrite else "xb") as zip_file:
+            zip_file.write(data)
         print(f"{LOG_PREFIX} Saved the wildcard backup")
+        return True
     except OSError as error:
         print(f"{LOG_PREFIX} Couldn't save the wildcard backup: {reason(error)}")
+        return False
+
+
+# Wildcard snapshots, taken by the Wildcard Snapshot node just before the wildcards are used, so the backup matches
+# the files the job really used, even if they're changed while it runs. One per wildcards folder, kept in memory
+# until ComfyUI closes: {folder: {"files": {name: ((modified, size), modified time, contents)}, "job": job,
+# "taken": when it was last checked}}.
+_snapshots = {}
+_snapshots_lock = threading.Lock()
+
+
+def folder_key(folder):
+    return os.path.normcase(os.path.realpath(folder))
+
+
+def current_job(prompt):
+    # The job running now: its ID from ComfyUI, or, on versions without one, the job's own settings, which every
+    # node in the job is handed as the very same object.
+    try:
+        from comfy_execution.utils import get_executing_context
+
+        context = get_executing_context()
+        if context is not None and context.prompt_id:
+            return str(context.prompt_id)
+    except Exception:
+        pass
+    return prompt
+
+
+def same_job(first, second):
+    if first is None or second is None:
+        return False
+    return first is second or (isinstance(first, str) and first == second)
+
+
+def take_snapshot(source, job):
+    # Brings the folder's snapshot up to date and confirms it for this job: only new and changed files (by modified
+    # time and size) are read, and deleted ones are dropped. Returns (files, updated, removed, first, taken).
+    key = folder_key(source)
+    with _snapshots_lock:
+        old = _snapshots.get(key)
+        if old is not None:
+            # Not confirmed for this job unless the whole folder is read.
+            old["job"] = None
+    old_files = old["files"] if old else {}
+    files = {}
+    updated = 0
+    for name, full_path in archiving.folder_files(source):
+        stat = os.stat(full_path)
+        mark = (stat.st_mtime_ns, stat.st_size)
+        previous = old_files.get(name)
+        if previous is not None and previous[0] == mark:
+            files[name] = previous
+            continue
+        with open(full_path, "rb") as file:
+            files[name] = (mark, stat.st_mtime, file.read())
+        updated += 1
+    removed = len(set(old_files) - set(files))
+    taken = time.time()
+    with _snapshots_lock:
+        _snapshots[key] = {"files": files, "job": job, "taken": taken}
+    return len(files), updated, removed, old is None, taken
+
+
+def clock_time(moment):
+    # Like "17:40:12 (2026-11-05)".
+    return time.strftime("%H:%M:%S (%Y-%m-%d)", time.localtime(moment))
+
+
+def wildcard_backup(wildcards_folder, compression, use_snapshot, prompt):
+    # The wildcard backup's zip: from the snapshot if one was confirmed during this job, otherwise read from the
+    # folder. Returns (zip or None, a line for the summary).
+    source = wildcards_source(wildcards_folder)
+    if use_snapshot:
+        with _snapshots_lock:
+            snapshot = _snapshots.get(folder_key(source))
+            if snapshot is not None and same_job(snapshot["job"], current_job(prompt)):
+                files = [(name, modified, contents) for name, (mark, modified, contents) in snapshot["files"].items()]
+                taken = clock_time(snapshot["taken"])
+            else:
+                files = None
+        if files is not None:
+            files.sort()
+            if not files:
+                print(f"{LOG_PREFIX} The wildcards folder is empty, so no backup was saved")
+                return None, f"Wildcards: the snapshot taken at {taken} is empty, so no backup was saved"
+            return archiving.zip_of(files, compression), f"Wildcards: from the snapshot taken at {taken}"
+    if not os.path.isdir(source):
+        print(f"{LOG_PREFIX} The wildcards folder doesn't exist, so no backup was saved")
+        return None, "Wildcards: the folder doesn't exist, so no backup was saved"
+    try:
+        data = archiving.wildcard_zip(source, compression)
+    except OSError as error:
+        print(f"{LOG_PREFIX} Couldn't read the wildcards folder: {reason(error)}")
+        return None, "Wildcards: couldn't read the folder, so no backup was saved"
+    if data is None:
+        print(f"{LOG_PREFIX} The wildcards folder is empty, so no backup was saved")
+        return None, "Wildcards: the folder is empty, so no backup was saved"
+    return data, "Wildcards: from the folder"
+
+
+# Wildcard locks. When a Save Workflow (wildcard lock) node is in the job, the snapshot node locks the wildcard
+# files before taking its snapshot, so they can't be changed before Random Prompts reads them, and the lock node,
+# wired after Random Prompts, unlocks them. Windows only: elsewhere, locks don't stop other programs.
+LOCK_NODE_TYPE = "BRBSaveWorkflowWildcardLock"
+# While the files are locked, the job is checked once a second. If it was cancelled or failed before the lock node
+# ran, the files are unlocked at once. If it finished without running it, they're unlocked, and a pop-up says so.
+# If it's still running after this many seconds without the lock node having run, a pop-up asks whether to unlock
+# them; until then, they stay locked until the job ends. The next snapshot also unlocks files still locked from an
+# earlier job.
+LOCK_TIMEOUT = 30
+LOCK_CHECK_EVERY = 1.0
+# {"id": ..., "handles": [...], "names": {folder: set of names}, "locked": when, "job": job, "stop": Event,
+#  "asked": whether the pop-up asked to unlock them}
+_lock_state = None
+_lock_guard = threading.Lock()
+
+
+def _windows_files():
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32, wintypes.HANDLE(-1).value
+
+
+def lock_folders(sources, job):
+    # Locks every file in the folders: each is opened so other programs can still read it, but not change,
+    # rename or delete it. Each is then checked by trying to open it the way an editor saving it would; if that
+    # works, it's closed again untouched, and the file counts as not locked. Returns (locked and checked, couldn't
+    # be locked), or None when locking isn't available here.
+    if os.name != "nt":
+        return None
+    release_lock()
+    kernel32, invalid = _windows_files()
+    generic_read, share_read, open_existing, normal = 0x80000000, 0x1, 3, 0x80
+    generic_write, delete_access, share_all = 0x40000000, 0x10000, 0x7
+    handles = []
+    names = {}
+    checked = 0
+    failed = 0
+    for source in sources:
+        try:
+            files = archiving.folder_files(source)
+        except OSError:
+            continue
+        names[source] = {name for name, full_path in files}
+        for name, full_path in files:
+            handle = kernel32.CreateFileW(full_path, generic_read, share_read, None, open_existing, normal, None)
+            if handle is None or handle == invalid:
+                # Usually another program has it open for writing.
+                failed += 1
+                continue
+            handles.append(handle)
+            # The check: opening it for writing and deleting must fail while it's locked. Opening an existing
+            # file doesn't change it.
+            test = kernel32.CreateFileW(
+                full_path, generic_write | delete_access, share_all, None, open_existing, normal, None
+            )
+            if test is not None and test != invalid:
+                kernel32.CloseHandle(test)
+                failed += 1
+            else:
+                checked += 1
+    state = {
+        "id": uuid.uuid4().hex, "handles": handles, "names": names, "locked": time.time(), "job": job,
+        "stop": threading.Event(), "asked": False,
+    }
+    global _lock_state
+    with _lock_guard:
+        _lock_state = state
+    threading.Thread(target=_watch_lock, args=(state,), daemon=True).start()
+    return checked, failed
+
+
+def release_lock():
+    # Unlocks the files, if any are locked. Returns (unlocked, seconds locked, new files in the folders), or None.
+    global _lock_state
+    with _lock_guard:
+        state, _lock_state = _lock_state, None
+    if state is None:
+        return None
+    state["stop"].set()
+    if state["asked"]:
+        # The pop-up asking whether to unlock them closes by itself.
+        send_to_page("brb.save_workflow.lock_released", {"id": state["id"]})
+    try:
+        kernel32, invalid = _windows_files()
+        for handle in state["handles"]:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    # Files added while locked couldn't be locked, so Random Prompts may have read them.
+    new = 0
+    for source, names in state["names"].items():
+        try:
+            new += sum(1 for name, full_path in archiving.folder_files(source) if name not in names)
+        except OSError:
+            pass
+    return len(state["handles"]), time.time() - state["locked"], new
+
+
+def job_status(job):
+    # Whether the job is "running", "finished" or "stopped" (cancelled or failed), from ComfyUI's queue and history.
+    # None when it can't be told, like on versions without job IDs.
+    if not isinstance(job, str):
+        return None
+    try:
+        from server import PromptServer
+
+        queue = PromptServer.instance.prompt_queue
+        current = getattr(queue, "get_current_queue_volatile", None) or queue.get_current_queue
+        running, queued = current()
+        if any(isinstance(item, (list, tuple)) and len(item) > 1 and item[1] == job for item in running):
+            return "running"
+        status = (queue.get_history(prompt_id=job).get(job) or {}).get("status") or {}
+        return "finished" if status.get("status_str") == "success" else "stopped"
+    except Exception:
+        return None
+
+
+def _watch_lock(state):
+    # Unlocks the files once the job is over, if the lock node hasn't unlocked them first, and asks whether to
+    # unlock them if the job runs for too long without it.
+    while not state["stop"].wait(LOCK_CHECK_EVERY):
+        status = job_status(state["job"])
+        if status not in ("stopped", "finished"):
+            if not state["asked"] and time.time() - state["locked"] >= LOCK_TIMEOUT:
+                state["asked"] = True
+                print(f"{LOG_PREFIX} The wildcard files have been locked for {LOCK_TIMEOUT} seconds without the "
+                      "lock node")
+                send_to_page("brb.save_workflow.lock_ask", {"id": state["id"], "seconds": LOCK_TIMEOUT})
+            continue
+        with _lock_guard:
+            still_locked = _lock_state is state
+        if not still_locked or release_lock() is None:
+            return
+        if status == "stopped":
+            # Cancelled or failed before the lock node ran: nothing's wrong with the lock.
+            print(f"{LOG_PREFIX} The job stopped before the lock node ran, so the wildcard files were unlocked")
+        else:
+            print(f"{LOG_PREFIX} The job finished without the lock node running, so the wildcard files were unlocked")
+            send_to_page("brb.save_workflow.lock_timeout", {"reason": "finished"})
+        return
+
+
+# Random Prompts only reads the wildcard files once, when it first runs after ComfyUI starts, so later edits aren't
+# used, and the backup wouldn't match what it used. Dynamic Prompts Wildcard Auto Reload makes it read edited files
+# on every run.
+AUTO_RELOAD_NAME = "Dynamic Prompts Wildcard Auto Reload"
+AUTO_RELOAD_REPO = "brb-comfyui-dynamicprompts-wildcard-auto-reload"
+
+
+def random_prompts_base():
+    # The shared base class of Dynamic Prompts' nodes, like Random Prompts, or None if it isn't installed.
+    try:
+        import nodes
+
+        for node_class in nodes.NODE_CLASS_MAPPINGS.values():
+            for base in getattr(node_class, "__mro__", ()):
+                if base.__name__ == "DPAbstractSamplerNode" and hasattr(base, "get_prompt"):
+                    return base
+    except Exception:
+        pass
+    return None
+
+
+def uses_random_prompts(prompt, base):
+    # Whether the job has a Dynamic Prompts node, like Random Prompts.
+    try:
+        import nodes
+
+        for node in prompt.values():
+            node_class = nodes.NODE_CLASS_MAPPINGS.get(node.get("class_type")) if isinstance(node, dict) else None
+            if node_class is not None and base in getattr(node_class, "__mro__", ()):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def random_prompts_folder():
+    # The wildcards folder Dynamic Prompts reads, worked out the way it does: the "wildcards" folder in the ComfyUI
+    # folder, or else the one inside its own add-on folder. Returns its key, or None if it can't be told.
+    try:
+        import folder_paths
+
+        folder = os.path.join(folder_paths.base_path, "wildcards")
+        if not os.path.exists(folder):
+            folder = os.path.join(folder_paths.folder_names_and_paths["custom_nodes"][0][0], "comfyui-dynamicprompts",
+                                  "wildcards")
+        return folder_key(folder)
+    except Exception:
+        return None
+
+
+def auto_reload_active(base):
+    # Whether Dynamic Prompts Wildcard Auto Reload has taken over Random Prompts' reading of the wildcard files.
+    return getattr(base.get_prompt, "__qualname__", "").startswith("patch_random_prompts.")
+
+
+def prompt_value(prompt, value, depth=0):
+    # A setting's value in the job. A value wired from another node is followed to that node, as long as it just
+    # holds a typed value. Returns (found, value).
+    if not isinstance(value, list):
+        return True, value
+    if depth > 10 or len(value) != 2:
+        return False, None
+    source = prompt.get(str(value[0]))
+    inputs = source.get("inputs") if isinstance(source, dict) else None
+    if not isinstance(inputs, dict):
+        return False, None
+    if len(inputs) == 1:
+        return prompt_value(prompt, next(iter(inputs.values())), depth + 1)
+    for name in ("value", "string", "text"):
+        if name in inputs:
+            return prompt_value(prompt, inputs[name], depth + 1)
+    return False, None
 
 
 def wildcards_source(wildcards_folder):
@@ -324,6 +627,7 @@ def store_leftovers(archive, folder, output, progress):
         print(f"{LOG_PREFIX} Stored {len(found)} file(s) left from failed saves")
     for each in folders:
         archiving.update_failed_folder(list_file, each, archive, output)
+    return len(found)
 
 
 def place_extractor(archive, only_update=False):
@@ -394,27 +698,21 @@ def save_failed(started, folder, json_name, text, zip_data, archive, output, err
         "reason": str(error) if isinstance(error, archiving.ArchiveError) else f"{type(error).__name__}: {error}",
         "folder": folder if saved else None,
     })
+    return saved
 
 
 def archive_save(started, base, ending, text, always_add_counter, backup_wildcards, wildcards_folder, archive_path,
-                 compress_every, retry_failed, compress_in_background, unique_id):
+                 compress_every, retry_failed, compress_in_background, unique_id, wildcard_snapshot, prompt, summary):
+    # Adds a line to summary for each thing it does.
     output = output_folder()
     archive = archive_folder_for(archive_path)
     folder = os.path.dirname(base)
     progress = NodeProgress(unique_id)
     progress.show("Archiving", 0.0)
     zip_data = None
+    wildcards_line = "Wildcards: backup_wildcards is off"
     if backup_wildcards:
-        source = wildcards_source(wildcards_folder)
-        if os.path.isdir(source):
-            try:
-                zip_data = archiving.wildcard_zip(source, "none")
-            except OSError as error:
-                print(f"{LOG_PREFIX} Couldn't read the wildcards folder: {reason(error)}")
-            if zip_data is None:
-                print(f"{LOG_PREFIX} The wildcards folder is empty, so no backup was saved")
-        else:
-            print(f"{LOG_PREFIX} The wildcards folder doesn't exist, so no backup was saved")
+        zip_data, wildcards_line = wildcard_backup(wildcards_folder, "none", wildcard_snapshot, prompt)
 
     json_name = os.path.basename(base) + ending
     try:
@@ -423,7 +721,9 @@ def archive_save(started, base, ending, text, always_add_counter, backup_wildcar
         if created:
             place_extractor(archive)
         if retry_failed:
-            store_leftovers(archive, folder, output, progress)
+            stored = store_leftovers(archive, folder, output, progress)
+            if stored:
+                summary.append(f"Stored {stored} file(s) left from failed saves")
         parts = archiving.folder_parts(folder, output)
         day, clock = archiving.stamp_parts(started)
         reader = archiving.Reader(archive)
@@ -441,15 +741,33 @@ def archive_save(started, base, ending, text, always_add_counter, backup_wildcar
     except Exception as error:
         if not isinstance(error, archiving.ArchiveError):
             print(f"{LOG_PREFIX} Archiving failed: {type(error).__name__}")
-        save_failed(started, folder, json_name, text, zip_data, archive, output, error)
+        if save_failed(started, folder, json_name, text, zip_data, archive, output, error):
+            summary.insert(0, "Archiving failed, so the workflow was saved to its folder, ending in .archive")
+        else:
+            summary.insert(0, "Archiving failed, and the workflow couldn't be saved to its folder either")
+        summary.append(wildcards_line)
         return
     print(f"{LOG_PREFIX} Archived the workflow")
+    summary.insert(0, "Archived the workflow and its wildcard backup" if zip_data is not None
+                   else "Archived the workflow")
+    summary.append(wildcards_line)
 
     if compress_every and count >= compress_every:
         if compress_in_background:
             threading.Thread(target=compress_archive, args=(archive, None), daemon=True).start()
+            summary.append("Compressing the archive in the background")
         else:
-            compress_archive(archive, progress)
+            took = compress_archive(archive, progress)
+            if took is None:
+                summary.append("Compressing the archive failed, so it'll be tried again on the next save")
+                summary.append(f"Saves since the last compression: {count:,}")
+            elif took is False:
+                summary.append("The archive was already being compressed")
+                summary.append(f"Saves since the last compression: {count:,}")
+            else:
+                summary.append(f"Compressed the archive in {archiving.duration(took)}")
+    else:
+        summary.append(f"Saves since the last compression: {count:,}")
 
 
 def compress_archive(archive, progress):
@@ -463,9 +781,13 @@ def compress_archive(archive, progress):
         send_to_page("brb.save_workflow.archive_problem", {
             "text": f"Compressing the archive failed, so it'll be tried again on the next save.\n\n{error}",
         })
-        return
-    if ran:
-        print(f"{LOG_PREFIX} Compressed the archive in {time.time() - started:.0f} second(s)")
+        return None
+    if not ran:
+        # Another compression of this archive was already running.
+        return False
+    took = time.time() - started
+    print(f"{LOG_PREFIX} Compressed the archive in {took:.0f} second(s)")
+    return took
 
 
 # The node's buttons, which run on the server, in the background, while the page shows their progress.
@@ -637,6 +959,19 @@ def add_routes():
             return web.json_response({"error": str(error)})
         return web.json_response({"task": run_task(action, archive)})
 
+    @routes.post("/brb_save_workflow/unlock")
+    async def unlock_wildcards(request):
+        # Sent by the pop-up asking whether to unlock the wildcard files. Only unlocks the lock it asked about.
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        with _lock_guard:
+            same = _lock_state is not None and _lock_state["id"] == data.get("id")
+        if same and release_lock() is not None:
+            print(f"{LOG_PREFIX} The wildcard files were unlocked from the pop-up")
+        return web.json_response({"ok": True})
+
     @routes.post("/brb_save_workflow/update_extractor")
     async def update_extractor(request):
         # Sent once by the page when the node loads: updates the Workflow Extractor next to a valid archive, if it's
@@ -681,6 +1016,13 @@ def add_routes():
 
 
 add_routes()
+
+
+def finish(result, summary):
+    # Puts the summary in the node's summary output, with a blank line between lines, so they show as separate
+    # paragraphs in Markdown.
+    result["result"] = (result["result"][0], "\n\n".join(summary))
+    return result
 
 
 class SaveWorkflow:
@@ -777,6 +1119,15 @@ class SaveWorkflow:
                                "compression doesn't compete with jobs for memory. On: it compresses alongside your "
                                "jobs instead.",
                 }),
+                # Added last, so workflows saved with earlier versions keep their other settings in place.
+                "wildcard_snapshot": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Makes the wildcard backup from the snapshot taken by a Save Workflow (wildcard "
+                               "snapshot) node, when one is wired in front of the Random Prompts node, so the backup "
+                               "matches the wildcard files the job really used, even if they're changed while it "
+                               "runs. Without that node in the job, the backup is read from the wildcards folder as "
+                               "usual. Off: always read from the folder, and the snapshot node skips this node.",
+                }),
             },
             "optional": {
                 "passthrough": (ANY, {
@@ -807,8 +1158,9 @@ class SaveWorkflow:
             },
         }
 
-    RETURN_TYPES = (ANY,)
-    RETURN_NAMES = ("passthrough",)
+    RETURN_TYPES = (ANY, "STRING")
+    RETURN_NAMES = ("passthrough", "summary")
+    OUTPUT_TOOLTIPS = ("The passthrough input, unchanged.", "What this node did in the run, one line for each thing.")
     FUNCTION = "save"
     OUTPUT_NODE = True
     CATEGORY = "utils"
@@ -817,11 +1169,13 @@ class SaveWorkflow:
     def save(self, extension, always_add_counter, api_format_only, format,
              backup_wildcards=False, zip_compression="9", wildcards_folder="wildcards", overwrite=False,
              keep_text=False, archive=False, archive_path=".workflows", compress_every=1000, retry_failed=True,
-             compress_in_background=False,
+             compress_in_background=False, wildcard_snapshot=True,
              passthrough=None, path=None, prompt=None, extra_pnginfo=None, unique_id=None, **texts):
         # The time of this save, taken first, before anything else is done.
         started = time.time()
-        result = {"result": (passthrough,)}
+        # What this run did, one line for each thing, sent out through the summary output.
+        summary = []
+        result = {"result": (passthrough, "")}
         # The text inputs that are connected, turned into text: {"text_1": "...", ...}
         saved_text = {}
         for number in range(1, TEXT_INPUTS + 1):
@@ -838,7 +1192,8 @@ class SaveWorkflow:
             data = extra_pnginfo.get("workflow") if isinstance(extra_pnginfo, dict) else None
         if data is None:
             print(f"{LOG_PREFIX} Nothing to save (the job wasn't queued from the ComfyUI page)")
-            return result
+            summary.append("Nothing to save: the job wasn't queued from the ComfyUI page")
+            return finish(result, summary)
 
         if saved_text and not api_format_only:
             # Saved in this node's entry in the file only. The job's own copy of the workflow is shared with
@@ -886,15 +1241,16 @@ class SaveWorkflow:
             # is ever overwritten.
             archive_save(
                 started, base, ending, text, always_add_counter, backup_wildcards, wildcards_folder, archive_path,
-                compress_every, retry_failed, compress_in_background, unique_id,
+                compress_every, retry_failed, compress_in_background, unique_id, wildcard_snapshot, prompt, summary,
             )
-            return result
+            return finish(result, summary)
 
         try:
             os.makedirs(folder, exist_ok=True)
         except OSError as error:
             print(f"{LOG_PREFIX} Couldn't create the folder to save in: {reason(error)}")
-            return result
+            summary.append("Couldn't create the folder to save in")
+            return finish(result, summary)
 
         if overwrite:
             # Always the exact name, replacing any file already there.
@@ -904,7 +1260,8 @@ class SaveWorkflow:
                     json_file.write(text)
             except OSError as error:
                 print(f"{LOG_PREFIX} Couldn't save the workflow: {reason(error)}")
-                return result
+                summary.append("Couldn't save the workflow")
+                return finish(result, summary)
         else:
             candidate = None if always_add_counter else base + ending
         number = None
@@ -925,25 +1282,199 @@ class SaveWorkflow:
                 candidate = None
             except OSError as error:
                 print(f"{LOG_PREFIX} Couldn't save the workflow: {reason(error)}")
-                return result
+                summary.append("Couldn't save the workflow")
+                return finish(result, summary)
 
         print(f"{LOG_PREFIX} Saved the workflow")
 
+        saved_line = "Saved the workflow to its folder"
+        wildcards_line = "Wildcards: backup_wildcards is off"
         if backup_wildcards:
-            source = wildcards_source(wildcards_folder)
-            if os.path.isdir(source):
-                write_wildcard_backup(zip_path_for(candidate, ending), source, zip_compression, overwrite)
+            zip_data, wildcards_line = wildcard_backup(wildcards_folder, zip_compression, wildcard_snapshot, prompt)
+            if zip_data is not None:
+                if write_wildcard_backup(zip_path_for(candidate, ending), zip_data, overwrite):
+                    saved_line = "Saved the workflow and its wildcard backup to their folder"
+                else:
+                    wildcards_line = "Wildcards: couldn't save the backup"
+        summary += [saved_line, wildcards_line]
+        return finish(result, summary)
+
+
+class WildcardSnapshot:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt_text": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "The prompt, sent out unchanged through the prompt_text output. Type it here, or wire it in "
+                               "from another node.",
+                }),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("prompt_text", "summary")
+    OUTPUT_TOOLTIPS = (
+        "The text, unchanged. Wire it into the Random Prompts node's text.",
+        "What this node did in the run, one line for each thing.",
+    )
+    FUNCTION = "snapshot"
+    CATEGORY = "utils"
+    DESCRIPTION = ("Takes a snapshot of the wildcards folder used by each Save Workflow node in the job, just before "
+                   "the wildcards are used, so the wildcard backup matches the files the job really used, even if "
+                   "they're changed while it runs. Wire it in front of the Random Prompts node.")
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Runs on every job, never skipped, so the snapshot is always checked.
+        return float("nan")
+
+    def snapshot(self, prompt_text, prompt=None):
+        summary = []
+        job = current_job(prompt)
+        # The wildcards folders of the Save Workflow nodes in this job that back up wildcards from a snapshot.
+        # Bypassed and muted nodes aren't part of the job, so they're left out.
+        folders = {}
+        unknown = 0
+        for node in (prompt or {}).values():
+            if not isinstance(node, dict) or node.get("class_type") != "BRBSaveWorkflow":
+                continue
+            inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+            found, backup = prompt_value(prompt, inputs.get("backup_wildcards", False))
+            if found and not backup:
+                continue
+            found, use = prompt_value(prompt, inputs.get("wildcard_snapshot", True))
+            if found and not use:
+                continue
+            found, folder = prompt_value(prompt, inputs.get("wildcards_folder", "wildcards"))
+            if not found or not isinstance(folder, str):
+                unknown += 1
+                continue
+            source = wildcards_source(folder)
+            folders.setdefault(folder_key(source), (folder.strip(), source))
+
+        if unknown:
+            print(f"{LOG_PREFIX} Couldn't tell which wildcards folder to take a snapshot of")
+            send_to_page("brb.save_workflow.snapshot_problem", {})
+            summary.append(f"Couldn't tell which wildcards folder to take a snapshot of for {unknown} Save "
+                           "Workflow node(s), so none was taken for them")
+        if not folders and not unknown:
+            summary.append("No Save Workflow node in this job backs up wildcards from a snapshot")
+
+        # Random Prompts in the job without the auto reload add-on, and its wildcards folder being backed up:
+        # edited wildcard files aren't used, so warn.
+        base = random_prompts_base()
+        if (base is not None and random_prompts_folder() in folders and uses_random_prompts(prompt or {}, base)
+                and not auto_reload_active(base)):
+            print(f"{LOG_PREFIX} {AUTO_RELOAD_NAME} isn't installed, so edited wildcard files aren't used")
+            summary.append(f"{AUTO_RELOAD_NAME} isn't installed, so Random Prompts doesn't use edited wildcard "
+                           "files until ComfyUI restarts, and the backup may not match what it used")
+            send_to_page("brb.save_workflow.reload_missing", {"name": AUTO_RELOAD_NAME, "repo": AUTO_RELOAD_REPO})
+
+        # With a lock node in the job, the files are locked first, so they can't change between the snapshot and
+        # Random Prompts reading them. Files still locked from an earlier job are unlocked either way.
+        locking = any(
+            isinstance(node, dict) and node.get("class_type") == LOCK_NODE_TYPE for node in (prompt or {}).values()
+        )
+        sources = [source for folder, source in folders.values() if os.path.isdir(source)]
+        if locking and sources:
+            locked = lock_folders(sources, job)
+            if locked is None:
+                summary.append("Locking only works on Windows, so the wildcard files weren't locked")
+                send_to_page("brb.save_workflow.lock_problem", {"windows": False})
             else:
-                print(f"{LOG_PREFIX} The wildcards folder doesn't exist, so no backup was saved")
-        return result
+                if locked[0]:
+                    summary.append(f"Locked {locked[0]:,} wildcard file(s), and checked that they're locked")
+                if locked[1]:
+                    summary.append(f"Couldn't lock {locked[1]:,} wildcard file(s), usually because another program "
+                                   "has them open")
+                    send_to_page("brb.save_workflow.lock_problem", {"windows": True, "failed": locked[1]})
+        else:
+            release_lock()
+
+        for folder, source in folders.values():
+            # The folder is named only when there's more than one.
+            label = f" ({folder})" if len(folders) > 1 else ""
+            if not os.path.isdir(source):
+                summary.append(f"The wildcards folder{label} doesn't exist, so no snapshot was taken")
+                continue
+            try:
+                count, updated, removed, first, taken = take_snapshot(source, job)
+            except OSError as error:
+                print(f"{LOG_PREFIX} Couldn't take a snapshot of the wildcards folder: {reason(error)}")
+                summary.append(f"Couldn't read the wildcards folder{label}, so no snapshot was taken")
+                continue
+            at = f" at {clock_time(taken)}"
+            if first:
+                summary.append(f"Took a snapshot of {count:,} wildcard file(s){label}{at}")
+            elif updated or removed:
+                changes = [f"{updated:,} updated"] if updated else []
+                changes += [f"{removed:,} removed"] if removed else []
+                summary.append(f"Snapshot of {count:,} wildcard file(s){label}{at}: {', '.join(changes)}")
+            else:
+                summary.append(f"Snapshot of {count:,} wildcard file(s){label}{at}: unchanged")
+        return (prompt_text, "\n\n".join(summary))
+
+
+class WildcardLock:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt_text": ("STRING", {
+                    "forceInput": True,
+                    "tooltip": "Wire in the Random Prompts node's output. It's sent out unchanged through the "
+                               "prompt_text output.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("prompt_text", "summary")
+    OUTPUT_TOOLTIPS = (
+        "The text, unchanged.",
+        "What this node did in the run, one line for each thing.",
+    )
+    FUNCTION = "unlock"
+    CATEGORY = "utils"
+    DESCRIPTION = ("Wired right after the Random Prompts node, it unlocks the wildcard files the Save Workflow "
+                   "(wildcard snapshot) node locked, once Random Prompts has read them. With this node in the job, "
+                   "the snapshot node locks the files before taking its snapshot, so they can't be changed until "
+                   "Random Prompts has read them. Windows only.")
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Runs on every job, never skipped, so the files are always unlocked.
+        return float("nan")
+
+    def unlock(self, prompt_text):
+        released = release_lock()
+        if released is None:
+            summary = ["No wildcard files were locked"]
+        else:
+            count, seconds, new = released
+            summary = [f"Unlocked {count:,} wildcard file(s) at {clock_time(time.time())}, after {seconds:.1f} sec"]
+            if new:
+                summary.append(f"{new:,} wildcard file(s) were added while the others were locked, so they "
+                               "couldn't be locked, and the backup may not match what Random Prompts read")
+        return (prompt_text, "\n\n".join(summary))
 
 
 NODE_CLASS_MAPPINGS = {
     "BRBSaveWorkflow": SaveWorkflow,
+    "BRBSaveWorkflowWildcardSnapshot": WildcardSnapshot,
+    "BRBSaveWorkflowWildcardLock": WildcardLock,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BRBSaveWorkflow": "Save Workflow",
+    "BRBSaveWorkflowWildcardSnapshot": "Save Workflow (wildcard snapshot)",
+    "BRBSaveWorkflowWildcardLock": "Save Workflow (wildcard lock)",
 }
 
 __all__ = ["WEB_DIRECTORY", "NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

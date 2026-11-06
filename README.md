@@ -16,6 +16,7 @@ Unless **overwrite** is on, it never replaces a file. If the name is already tak
 - **backup_wildcards:** also saves a zip of the wildcards folder next to the workflow file, with the same name, like `my_clip_00007.zip`. That way you know exactly which wildcard files a result was made with.
 - **zip_compression:** how much the wildcard backup is compressed, from 1 (fastest) to 9 (smallest, the default). `none` stores the files without compression. Each zip is larger, but if you keep many backups in an archive that stores only differences, such as Git, uncompressed zips take up far less space overall.
 - **wildcards_folder:** the folder to back up. `wildcards` means the one inside the ComfyUI folder, where Dynamic Prompts keeps its wildcards. A full path works too.
+- **wildcard_snapshot:** makes the wildcard backup from the snapshot taken by a [Save Workflow (wildcard snapshot)](#wildcard-snapshot) node, when one is in the job. On by default. Without that node, the backup is read from the wildcards folder as usual.
 - **overwrite:** saves to the exact same name every time, replacing the file and its wildcard backup if they already exist. No number is ever added. Turning it on turns off **always_add_counter**, and the other way around. Useful when another program picks up the file after each job. Off by default, so existing files are never replaced.
 - **archive:** saves the workflow and its wildcard backup into an archive instead of the folder. See [Archiving](#archiving) below. Off by default.
 - **archive_path:** where the archive is. A name or relative path, like `.workflows` (the default), is inside ComfyUI's output folder, and a full path is used as is.
@@ -23,6 +24,45 @@ Unless **overwrite** is on, it never replaces a file. If the name is already tak
 - **retry_failed:** stores files left from failed saves on later saves. On by default.
 - **compress_in_background:** off by default, so the job pauses while the archive compresses. Turn it on to compress alongside your jobs instead.
 - **keep_text:** off by default, so the text in the boxes is only shown, and is lost on undo or when you open the workflow again. Turn it on to keep the text with your workflow. The saved workflow file always gets the text either way.
+
+## Outputs
+
+- **passthrough:** the **passthrough** input, unchanged.
+- **summary:** what the node did in the run, one line for each thing, with a blank line between them so they show separately in Markdown, like:
+
+  ```
+  Archived the workflow and its wildcard backup
+
+  Wildcards: from the snapshot taken at 17:40:12 (2026-11-05)
+
+  Saves since the last compression: 688
+  ```
+
+  Wire it into a text display node to see it.
+
+## Wildcard snapshot
+
+The wildcard backup is made when Save Workflow runs, at the end of the job. If you change a wildcard file while the job runs, the backup gets the changed file, not the one the job used. The **Save Workflow (wildcard snapshot)** node fixes that by taking a snapshot of the wildcards folder just before the wildcards are used.
+
+- **Wiring it:** put it between the prompt text and the Random Prompts node. Type the prompt into its **prompt_text** box, or wire the text into it, then wire its **prompt_text** output into Random Prompts' **text**. It passes the text through unchanged. ComfyUI always runs it right before Random Prompts, so the snapshot matches the files Random Prompts reads.
+- **No settings:** it finds the Save Workflow nodes in the job and takes a snapshot of each one's **wildcards_folder**. It skips nodes with **backup_wildcards** or **wildcard_snapshot** off, and bypassed ones. If **wildcards_folder** is wired from a node that works out the folder while the job runs, it can't tell which folder that is, so it takes no snapshot for it and a pop-up says so.
+- **Needs Dynamic Prompts Wildcard Auto Reload:** Random Prompts only reads the wildcard files once after ComfyUI starts, so without [Dynamic Prompts Wildcard Auto Reload](https://github.com/BigRedBrent/brb-comfyui-dynamicprompts-wildcard-auto-reload), files edited since then aren't used, and the backup may not match what it used. If Random Prompts is in the job, **wildcards_folder** is the folder it reads, and that add-on isn't installed, a pop-up says so, and it updates in place on later jobs.
+- **Fast:** the snapshot is kept in memory until ComfyUI closes. Each job, only new and changed files are read again, so an unchanged folder takes a few milliseconds.
+- **Checking it works:** wire either node's **summary** output into a text display node. The snapshot node shows something like `Snapshot of 34 wildcard file(s) at 17:40:12 (2026-11-05): 2 updated`, and Save Workflow shows `Wildcards: from the snapshot taken at 17:40:12 (2026-11-05)`. The same time on both means Save Workflow used the snapshot from that job. Save Workflow only uses a snapshot taken during the same job, and otherwise reads the folder, showing `Wildcards: from the folder`.
+
+### Wildcard lock
+
+ComfyUI doesn't always run Random Prompts right after the snapshot node. Another node, like a model loader, can run in between, so a wildcard file changed during that time could be read by Random Prompts but not be in the snapshot. The **Save Workflow (wildcard lock)** node closes that gap on Windows.
+
+- **Wiring it:** wire Random Prompts' output into its **prompt_text** input, and its **prompt_text** output on to wherever Random Prompts' output went. It passes the text through unchanged.
+- **What it does:** with this node in the job, the snapshot node locks the wildcard files before taking its snapshot. Other programs can still read them, but not change, rename or delete them, and it checks each one by trying to open it for writing, which must fail. Once Random Prompts has read them, this node unlocks them, usually within a split second, or a few seconds when a model loads in between. Saving a wildcard file in an editor fails while it's locked, so just save again.
+- **New files:** a file added to the folder while the others are locked can't be locked. If one appears, the lock node's **summary** says so, since the backup may not match what Random Prompts read.
+- **If the job is cancelled or fails** before the lock node runs, the files are unlocked within a second.
+- **If the job finishes without running the lock node**, the files are unlocked, and a pop-up says the lock node's output needs to lead on to something, since ComfyUI skips nodes that lead nowhere.
+- **If the job runs for 30 seconds without the lock node unlocking them**, a pop-up asks whether to unlock them now. Otherwise they stay locked until the job ends, and the pop-up closes by itself. This usually means the lock node isn't wired right after Random Prompts. The next job's snapshot also unlocks any files still locked.
+- **If files can't be locked**, usually because another program has them open, a pop-up says how many, and it updates in place on later jobs.
+- **Turning it off:** bypass or remove the lock node. The snapshot node only locks files when the lock node is in the job.
+- **Windows only:** on Linux and Mac, other programs ignore locks, so the files aren't locked, and a pop-up says so. Bypass or remove the lock node there.
 
 ## Archiving
 

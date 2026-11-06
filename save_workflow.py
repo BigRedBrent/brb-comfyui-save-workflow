@@ -846,8 +846,8 @@ def run_watched(archive, args, text, progress, should_stop, started):
 def compress(archive, progress=None, rebuild=False, should_stop=None):
     # Compresses the archive: clears its history, so nothing old is kept for it, then packs everything into one
     # storage file. A rebuild redoes every match from scratch, for the smallest archive, then checks everything is
-    # intact. Saves made meanwhile are safe: new files are only deleted by a later compression once they're two
-    # weeks old and still unused, and the history is only replaced if nothing else changed it meanwhile.
+    # intact. Saves made meanwhile are safe: new files are only deleted by a later compression once they're 27
+    # hours old and still unused, and the history is only replaced if nothing else changed it meanwhile.
     # Returns True if it ran, or False if another compression of this archive was already running.
     lock = compress_lock(archive)
     if not lock.acquire(blocking=False):
@@ -941,33 +941,47 @@ def _restart_history(archive, subtract, message):
 
 # The wildcard backup, built in memory.
 
-def wildcard_zip(folder, compression):
-    # Every file in the folder and its subfolders, sorted by name, each with its own date, so an unchanged folder
-    # always gives exactly the same zip. Returns None if the folder is empty.
+def folder_files(folder):
+    # Every file in the folder and its subfolders, as (name inside the folder, full path), sorted by name.
     files = []
     for dirpath, dirnames, filenames in os.walk(folder):
         for file_name in filenames:
             full_path = os.path.join(dirpath, file_name)
             files.append((os.path.relpath(full_path, folder).replace(os.sep, "/"), full_path))
     files.sort()
+    return files
+
+
+def zip_of(files, compression):
+    # A zip of (name, modified time, contents), in name order, each with its own date, so unchanged files always
+    # give exactly the same zip. Returns None if there are no files.
     if not files:
         return None
     uncompressed = compression == "none"
     method = zipfile.ZIP_STORED if uncompressed else zipfile.ZIP_DEFLATED
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        for name, full_path in files:
-            modified = time.localtime(os.stat(full_path).st_mtime)
-            date = max(tuple(modified[:6]), (1980, 1, 1, 0, 0, 0))
+        for name, modified, contents in files:
+            date = max(tuple(time.localtime(modified)[:6]), (1980, 1, 1, 0, 0, 0))
             info = zipfile.ZipInfo(name, date_time=date)
             info.compress_type = method
             info.external_attr = 0o644 << 16
-            with open(full_path, "rb") as source:
-                if uncompressed:
-                    archive.writestr(info, source.read())
-                else:
-                    archive.writestr(info, source.read(), compresslevel=int(compression))
+            if uncompressed:
+                archive.writestr(info, contents)
+            else:
+                archive.writestr(info, contents, compresslevel=int(compression))
     return buffer.getvalue()
+
+
+def wildcard_zip(folder, compression):
+    # Every file in the folder and its subfolders, sorted by name, each with its own date, so an unchanged folder
+    # always gives exactly the same zip. Returns None if the folder is empty.
+    files = []
+    for name, full_path in folder_files(folder):
+        modified = os.stat(full_path).st_mtime
+        with open(full_path, "rb") as source:
+            files.append((name, modified, source.read()))
+    return zip_of(files, compression)
 
 
 # Archive All: checking that a file really is a workflow or a wildcard backup.

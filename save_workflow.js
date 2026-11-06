@@ -35,6 +35,7 @@ const NEWER_DEFAULTS = {
     compress_every: 1000,
     retry_failed: true,
     compress_in_background: false,
+    wildcard_snapshot: true,
 };
 
 // The settings grayed out while "archive" is on, and the node's buttons.
@@ -568,6 +569,153 @@ function showArchiveFailure(detail) {
     failurePopup.text.textContent = `${times}${where}\n\nLatest reason:\n${detail?.reason || "Unknown."}`;
 }
 
+// When a Save Workflow (wildcard snapshot) node can't tell which wildcards folder to take a snapshot of. Like the
+// archiving failure pop-up, it updates in place while it's open.
+let snapshotPopup = null;
+
+function showSnapshotProblem() {
+    if (!snapshotPopup) {
+        const { holder, box } = floatingPopup("Wildcard Snapshot");
+        const text = popupText("");
+        box.appendChild(text);
+        const ok = popupButton("OK");
+        box.appendChild(buttonRow(ok, null));
+        snapshotPopup = { holder, text, count: 0 };
+        ok.addEventListener("click", () => {
+            holder.remove();
+            snapshotPopup = null;
+        });
+    }
+    snapshotPopup.count += 1;
+    const times = snapshotPopup.count === 1 ? "" : `\n\nThis happened ${snapshotPopup.count} times.`;
+    snapshotPopup.text.textContent =
+        "The wildcard snapshot node couldn't tell which wildcards folder to take a snapshot of, because a Save " +
+        "Workflow node's wildcards_folder is wired from a node that works out the folder while the job runs. No " +
+        "snapshot was taken for it, so its wildcard backup was read from the folder instead.\n\nType the folder " +
+        "into wildcards_folder, or wire it from a node that just holds the text." + times;
+}
+
+// When the job finished without the lock node unlocking the wildcard files. Like the others, it updates in place
+// while it's open.
+let lockPopup = null;
+
+function showLockTimeout(detail) {
+    if (!lockPopup) {
+        const { holder, box } = floatingPopup("Wildcard Lock");
+        const text = popupText("");
+        box.appendChild(text);
+        const ok = popupButton("OK");
+        box.appendChild(buttonRow(ok, null));
+        lockPopup = { holder, text, count: 0 };
+        ok.addEventListener("click", () => {
+            holder.remove();
+            lockPopup = null;
+        });
+    }
+    lockPopup.count += 1;
+    const times = lockPopup.count === 1 ? "" : `\n\nThis happened ${lockPopup.count} times.`;
+    lockPopup.text.textContent =
+        "The job finished without the Save Workflow (wildcard lock) node running, so the wildcard files were " +
+        "unlocked automatically.\n\nComfyUI only runs a node whose output leads on to something that's saved or " +
+        "shown, so wire the lock node's prompt_text output on to wherever the Random Prompts node's output went." +
+        times;
+}
+
+// When the job has run for a long time without the lock node unlocking the wildcard files: asks whether to unlock
+// them. It closes by itself once they're unlocked some other way, like when the job ends.
+let lockAskPopup = null;
+
+function showLockAsk(detail) {
+    lockAskPopup?.holder.remove();
+    const { holder, box } = floatingPopup("Wildcard Lock");
+    const seconds = Number(detail?.seconds) || 30;
+    box.appendChild(popupText(
+        `The wildcard files have been locked for ${seconds} seconds, and the job is still running without the ` +
+        "Save Workflow (wildcard lock) node unlocking them. This usually means the lock node isn't wired right " +
+        "after the Random Prompts node.\n\nUnlock them now? Otherwise, they stay locked until the job ends."
+    ));
+    const unlock = popupButton("Unlock");
+    const keep = popupButton("Keep Locked");
+    box.appendChild(buttonRow(unlock, keep));
+    const id = detail?.id;
+    lockAskPopup = { holder, id };
+    const close = () => {
+        holder.remove();
+        if (lockAskPopup?.holder === holder) {
+            lockAskPopup = null;
+        }
+    };
+    unlock.addEventListener("click", () => {
+        close();
+        api.fetchApi("/brb_save_workflow/unlock", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id }),
+        }).catch(() => {});
+    });
+    keep.addEventListener("click", close);
+}
+
+function closeLockAsk(detail) {
+    if (lockAskPopup && lockAskPopup.id === detail?.id) {
+        lockAskPopup.holder.remove();
+        lockAskPopup = null;
+    }
+}
+
+// When the snapshot node couldn't lock some wildcard files. Like the others, it updates in place while it's open.
+let lockProblemPopup = null;
+
+function showLockProblem(detail) {
+    if (!lockProblemPopup) {
+        const { holder, box } = floatingPopup("Wildcard Lock");
+        const text = popupText("");
+        box.appendChild(text);
+        const ok = popupButton("OK");
+        box.appendChild(buttonRow(ok, null));
+        lockProblemPopup = { holder, text, count: 0 };
+        ok.addEventListener("click", () => {
+            holder.remove();
+            lockProblemPopup = null;
+        });
+    }
+    lockProblemPopup.count += 1;
+    const times = lockProblemPopup.count === 1 ? "" : `\n\nThis happened ${lockProblemPopup.count} times.`;
+    const problem = detail?.windows === false
+        ? "Locking only works on Windows, so the wildcard files weren't locked."
+        : `${Number(detail?.failed) || 0} wildcard file(s) couldn't be locked, usually because another program ` +
+          "has them open. They could still be changed before the Random Prompts node reads them.";
+    lockProblemPopup.text.textContent =
+        `${problem}\n\nTo stop locking, bypass or remove the Save Workflow (wildcard lock) node.${times}`;
+}
+
+// When Random Prompts is used without Dynamic Prompts Wildcard Auto Reload. Like the others, it updates in place
+// while it's open.
+let reloadPopup = null;
+
+function showReloadMissing(detail) {
+    if (!reloadPopup) {
+        const { holder, box } = floatingPopup("Wildcard Snapshot");
+        const text = popupText("");
+        box.appendChild(text);
+        const ok = popupButton("OK");
+        box.appendChild(buttonRow(ok, null));
+        reloadPopup = { holder, text, count: 0 };
+        ok.addEventListener("click", () => {
+            holder.remove();
+            reloadPopup = null;
+        });
+    }
+    reloadPopup.count += 1;
+    const times = reloadPopup.count === 1 ? "" : `\n\nThis happened ${reloadPopup.count} times.`;
+    const name = detail?.name || "Dynamic Prompts Wildcard Auto Reload";
+    const repo = detail?.repo || "brb-comfyui-dynamicprompts-wildcard-auto-reload";
+    reloadPopup.text.textContent =
+        "Random Prompts only reads the wildcard files once after ComfyUI starts, so files edited since then " +
+        "aren't used, and the wildcard backup may not match what it used.\n\n" +
+        `Install ${name} (${repo}) so edited wildcard files are used on the next run.${times}`;
+}
+
 // A button's task: a pop-up showing its progress, then its result.
 async function runTask(node, action) {
     const archivePath = findWidget(node, "archive_path")?.value ?? ".workflows";
@@ -794,6 +942,12 @@ app.registerExtension({
     name: "BRB.SaveWorkflow",
     setup() {
         api.addEventListener("brb.save_workflow.archive_failed", (event) => showArchiveFailure(event.detail));
+        api.addEventListener("brb.save_workflow.snapshot_problem", () => showSnapshotProblem());
+        api.addEventListener("brb.save_workflow.lock_timeout", (event) => showLockTimeout(event.detail));
+        api.addEventListener("brb.save_workflow.lock_problem", (event) => showLockProblem(event.detail));
+        api.addEventListener("brb.save_workflow.lock_ask", (event) => showLockAsk(event.detail));
+        api.addEventListener("brb.save_workflow.lock_released", (event) => closeLockAsk(event.detail));
+        api.addEventListener("brb.save_workflow.reload_missing", (event) => showReloadMissing(event.detail));
         api.addEventListener("brb.save_workflow.archive_problem", (event) => {
             if (event.detail?.text) {
                 messagePopup(event.detail.text);
@@ -811,7 +965,8 @@ app.registerExtension({
             moveAfter(this, "overwrite", "always_add_counter");
             insertGapAfter(this, "format");
             linkToggles(this, "overwrite", "always_add_counter");
-            insertGapAfter(this, "wildcards_folder");
+            moveAfter(this, "wildcard_snapshot", "wildcards_folder");
+            insertGapAfter(this, "wildcard_snapshot");
             addArchiveButtons(this);
             // keep_text goes below the buttons, after a gap.
             insertGapAfter(this, BUTTONS[BUTTONS.length - 1].label);
