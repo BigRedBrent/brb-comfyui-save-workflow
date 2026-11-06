@@ -1,5 +1,5 @@
 """
-Workflow Extractor: searches a Save Workflow archive by file name, and extracts or removes the files found.
+Workflow Extractor: searches a Save Workflow archive by file name, and extracts or deletes the files found.
 
 Save Workflow copies this next to each archive it saves to. Double-click it to open the archive. It finds the
 archive by itself: it looks in its own folder first, then in the folders directly inside it. If it finds more
@@ -14,7 +14,7 @@ Click the Name or Stored heading to sort by that column first, and click it agai
 column, in its own order, decides between files that are the same in the first. Then:
 - Extract All or Extract Selected copies the files out, in the folders they were saved in, into a folder next
   to the archive named after it, like ".workflows_extracted". The originals remain in the archive.
-- Remove All or Remove Selected takes the files out of the archive, after you type REMOVE to confirm.
+- Delete All or Delete Selected deletes the files from the archive, after you type DELETE to confirm.
 
 Requires Git for Windows (git must be available from the command line).
 """
@@ -57,7 +57,7 @@ BOOKMARK_REF = "refs/workflowarchive/compressed"
 # Shown when hovering over the "Scrub immediately" box.
 SCRUB_TOOLTIP = [
     # (text, bold, extra space above, centered)
-    ("Scrubs the removed files’ data from the archive right away.", False, False, False),
+    ("Scrubs the deleted files’ data from the archive right away.", False, False, False),
     ("WARNING!!!", True, True, True),
     (
         "Only use this while nothing else is using the archive: if ComfyUI saves to it at the same moment, the files "
@@ -307,25 +307,25 @@ def extract(archive, entries, folder, progress):
     return saved
 
 
-def remove(archive, entries, scrub, progress):
-    to_remove = {entry.stored for entry in entries}
+def delete(archive, entries, scrub, progress):
+    to_delete = {entry.stored for entry in entries}
     env = dict(os.environ)
     env.update(GIT_IDENTITY)
-    progress(f"Removing {len(to_remove):,} file(s)...")
+    progress(f"Deleting {len(to_delete):,} file(s)...")
 
     # The remaining files are saved as a fresh start with no history, so nothing in the archive refers to the
-    # removed files anymore. The change is only made if nothing else changed the archive in the meantime, like
+    # deleted files anymore. The change is only made if nothing else changed the archive in the meantime, like
     # ComfyUI saving to it; if something did, it's done again from the archive as it is now.
     for _ in range(50):
         old = current_commit(archive)
-        kept = [item for item in read_tree(archive, old) if item[2] not in to_remove]
+        kept = [item for item in read_tree(archive, old) if item[2] not in to_delete]
         with tempfile.TemporaryDirectory() as temporary:
             index_env = dict(env)
             index_env["GIT_INDEX_FILE"] = str(Path(temporary) / "index")
             index_text = "".join(f"{mode} {content_id}\t{name}\n" for mode, content_id, name in kept)
             run_git(archive, ["update-index", "--add", "--index-info"], index_text.encode("utf-8"), index_env)
             tree = run_git(archive, ["write-tree"], env=index_env).decode("utf-8").strip()
-        message = f"Removed {len(to_remove)} workflow file(s)"
+        message = f"Deleted {len(to_delete)} workflow file(s)"
         commit = run_git(archive, ["commit-tree", tree, "-m", message], env=env).decode("utf-8").strip()
         try:
             run_git(archive, ["update-ref", f"refs/heads/{BRANCH}", commit, old or ("0" * 40)])
@@ -334,22 +334,22 @@ def remove(archive, entries, scrub, progress):
             time.sleep(0.1)
             continue
     else:
-        raise RuntimeError("The archive kept changing while removing. Nothing was removed. Try again.")
+        raise RuntimeError("The archive kept changing while deleting. Nothing was deleted. Try again.")
 
-    # Save Workflow's bookmark would otherwise keep the old history, and the removed files with it.
+    # Save Workflow's bookmark would otherwise keep the old history, and the deleted files with it.
     run_git(archive, ["update-ref", BOOKMARK_REF, commit])
     run_git(archive, ["reflog", "expire", "--expire=now", "--all"])
 
     if scrub:
-        progress("Scrubbing the removed files’ data. This can take a minute...")
+        progress("Scrubbing the deleted files’ data. This can take a minute...")
         run_git(archive, ["repack", "-a", "-d", "-q"])
         run_git(archive, ["prune", "--expire=now"])
 
     # Check the files are gone.
     remaining = {name for _, _, name in read_tree(archive, current_commit(archive))}
-    if remaining & to_remove:
-        raise RuntimeError(f"{len(remaining & to_remove)} file(s) are still in the archive.")
-    return len(to_remove)
+    if remaining & to_delete:
+        raise RuntimeError(f"{len(remaining & to_delete)} file(s) are still in the archive.")
+    return len(to_delete)
 
 
 def place_buttons(frame, cancel_button, action_button):
@@ -681,10 +681,10 @@ class ExtractorWindow:
         self.extract_selected_button.pack(side="right")
         self.extract_button = ttk.Button(bottom, text="Extract All", command=self.extract_all)
         self.extract_button.pack(side="right", padx=(0, 6))
-        self.remove_selected_button = ttk.Button(bottom, text="Remove Selected", command=self.remove_selected)
-        self.remove_selected_button.pack(side="right", padx=(0, 12))
-        self.remove_button = ttk.Button(bottom, text="Remove All", command=self.remove_all)
-        self.remove_button.pack(side="right", padx=(0, 6))
+        self.delete_selected_button = ttk.Button(bottom, text="Delete Selected", command=self.delete_selected)
+        self.delete_selected_button.pack(side="right", padx=(0, 24))
+        self.delete_button = ttk.Button(bottom, text="Delete All", command=self.delete_all)
+        self.delete_button.pack(side="right", padx=(0, 6))
         self.update_buttons()
 
         self.run_in_background(
@@ -734,9 +734,9 @@ class ExtractorWindow:
         has_selected = "normal" if self.results.selection() and not self.busy else "disabled"
         self.search_button.configure(state=state)
         self.extract_button.configure(state=has_matches)
-        self.remove_button.configure(state=has_matches)
+        self.delete_button.configure(state=has_matches)
         self.extract_selected_button.configure(state=has_selected)
-        self.remove_selected_button.configure(state=has_selected)
+        self.delete_selected_button.configure(state=has_selected)
 
     # The list of results.
 
@@ -1008,10 +1008,10 @@ class ExtractorWindow:
             lambda progress: extract(self.archive, entries, folder, progress), done, "Extracting..."
         )
 
-    # Removing.
+    # Deleting.
 
-    def confirm_remove(self, entries):
-        # A confirmation window whose Remove button only works once REMOVE is typed, in capitals.
+    def confirm_delete(self, entries):
+        # A confirmation window whose Delete button only works once DELETE is typed, in capitals.
         # It's created fresh each time, so the typing box always starts empty and the box unchecked.
         count = len(entries)
         preview = "\n".join(f"{entry.shown}   {entry.date}".rstrip() for entry in entries[:10])
@@ -1019,7 +1019,7 @@ class ExtractorWindow:
             preview += f"\n...and {count - 10:,} more"
 
         dialog = tk.Toplevel(self.root)
-        dialog.title("Confirm Remove")
+        dialog.title("Confirm Delete")
         dialog.transient(self.root)
         dialog.resizable(False, False)
         result = {"confirmed": False, "scrub": False}
@@ -1028,7 +1028,7 @@ class ExtractorWindow:
         frame.pack(fill="both", expand=True)
         ttk.Label(
             frame,
-            text=f"Permanently remove {count:,} file(s) from the archive?\n\n{preview}\n\n"
+            text=f"Permanently delete {count:,} file(s) from the archive?\n\n{preview}\n\n"
             "They can't be recovered from the archive afterward.",
             justify="left",
         ).pack(anchor="w")
@@ -1038,7 +1038,7 @@ class ExtractorWindow:
         scrub_box.pack(anchor="w", pady=(12, 0))
         Tooltip(scrub_box, SCRUB_TOOLTIP)
 
-        ttk.Label(frame, text="Type REMOVE to confirm:").pack(anchor="w", pady=(12, 2))
+        ttk.Label(frame, text="Type DELETE to confirm:").pack(anchor="w", pady=(12, 2))
         typed = tk.StringVar()
         entry = ttk.Entry(frame, textvariable=typed, width=20)
         entry.pack(anchor="w")
@@ -1047,19 +1047,19 @@ class ExtractorWindow:
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(12, 0))
 
-        def do_remove():
-            if typed.get() == "REMOVE":
+        def do_delete():
+            if typed.get() == "DELETE":
                 result["confirmed"] = True
                 result["scrub"] = scrub.get()
                 dialog.destroy()
 
-        # Remove in the middle, Cancel at the far right.
-        remove_button = ttk.Button(buttons, text="Remove", command=do_remove, state="disabled")
+        # Delete in the middle, Cancel at the far right.
+        delete_button = ttk.Button(buttons, text="Delete", command=do_delete, state="disabled")
         cancel_button = ttk.Button(buttons, text="Cancel", command=dialog.destroy)
-        place_buttons(buttons, cancel_button, remove_button)
+        place_buttons(buttons, cancel_button, delete_button)
 
         def update_button(*_):
-            remove_button.configure(state="normal" if typed.get() == "REMOVE" else "disabled")
+            delete_button.configure(state="normal" if typed.get() == "DELETE" else "disabled")
 
         typed.trace_add("write", update_button)
 
@@ -1071,38 +1071,38 @@ class ExtractorWindow:
         self.show_dialog(dialog, entry)
         return result["confirmed"], result["scrub"]
 
-    def remove_all(self):
-        self.remove_entries(list(self.matches))
+    def delete_all(self):
+        self.delete_entries(list(self.matches))
 
-    def remove_selected(self):
-        self.remove_entries(self.selected_entries())
+    def delete_selected(self):
+        self.delete_entries(self.selected_entries())
 
-    def remove_entries(self, entries):
+    def delete_entries(self, entries):
         if not entries or self.busy:
             return
-        confirmed, scrub = self.confirm_remove(entries)
+        confirmed, scrub = self.confirm_delete(entries)
         # One last chance to back out.
         if confirmed:
             count = len(entries)
             note = "\nTheir data will be scrubbed right away." if scrub else ""
             confirmed = self.confirm(
-                "Confirm Remove",
-                f"Are you sure?\n\n{count:,} file{'' if count == 1 else 's'} will be permanently removed from the "
+                "Confirm Delete",
+                f"Are you sure?\n\n{count:,} file{'' if count == 1 else 's'} will be permanently deleted from the "
                 f"archive.{note}",
                 "Continue",
                 centered=True,
             )
         if not confirmed:
-            self.status.configure(text="Nothing was removed.")
+            self.status.configure(text="Nothing was deleted.")
             return
 
-        def done(removed):
+        def done(deleted):
             # Search again, so the list shows what's left.
             self.search()
             note = " Their data was scrubbed." if scrub else ""
-            self.message(f"Removed {removed:,} file(s) from the archive.{note}")
+            self.message(f"Deleted {deleted:,} file(s) from the archive.{note}")
 
-        self.run_in_background(lambda progress: remove(self.archive, entries, scrub, progress), done, "Removing...")
+        self.run_in_background(lambda progress: delete(self.archive, entries, scrub, progress), done, "Deleting...")
 
 
 # Kept for as long as the window is open, so Windows knows this archive is already open in the Workflow Extractor.

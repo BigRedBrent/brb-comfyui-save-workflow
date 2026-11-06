@@ -16,6 +16,7 @@ import { ComfyWidgets } from "../../scripts/widgets.js";
 //   Nothing is ever written to the browser's console.
 
 const NODE_TYPE = "BRBSaveWorkflow";
+const SNAPSHOT_NODE_TYPE = "BRBSaveWorkflowWildcardSnapshot";
 
 // Height of the empty space between "format" and "backup_wildcards".
 const GAP_HEIGHT = 10;
@@ -595,7 +596,7 @@ function showSnapshotProblem() {
         "into wildcards_folder, or wire it from a node that just holds the text." + times;
 }
 
-// When the job finished without the lock node unlocking the wildcard files. Like the others, it updates in place
+// When the job finished without the unlock node unlocking the wildcard files. Like the others, it updates in place
 // while it's open.
 let lockPopup = null;
 
@@ -615,24 +616,29 @@ function showLockTimeout(detail) {
     lockPopup.count += 1;
     const times = lockPopup.count === 1 ? "" : `\n\nThis happened ${lockPopup.count} times.`;
     lockPopup.text.textContent =
-        "The job finished without the Save Workflow (wildcard lock) node running, so the wildcard files were " +
+        "The job finished without the Save Workflow (wildcard unlock) node running, so the wildcard files were " +
         "unlocked automatically.\n\nComfyUI only runs a node whose output leads on to something that's saved or " +
-        "shown, so wire the lock node's prompt_text output on to wherever the Random Prompts node's output went." +
+        "shown, so wire the unlock node's prompt_text output on to wherever the Random Prompts node's output went." +
         times;
 }
 
-// When the job has run for a long time without the lock node unlocking the wildcard files: asks whether to unlock
-// them. It closes by itself once they're unlocked some other way, like when the job ends.
+// When the job has run for a long time without the unlock node unlocking the wildcard files: asks whether to unlock
+// them. It closes by itself once they're unlocked some other way, like when the job ends. Keep Locked asks again 30
+// seconds later if they're still locked by then.
 let lockAskPopup = null;
 
 function showLockAsk(detail) {
     lockAskPopup?.holder.remove();
     const { holder, box } = floatingPopup("Wildcard Lock");
     const seconds = Number(detail?.seconds) || 30;
+    const minutes = Math.floor(seconds / 60);
+    const howLong = minutes ? `${minutes} min${seconds % 60 ? ` ${seconds % 60} sec` : ""}` : `${seconds} seconds`;
     box.appendChild(popupText(
-        `The wildcard files have been locked for ${seconds} seconds, and the job is still running without the ` +
-        "Save Workflow (wildcard lock) node unlocking them. This usually means the lock node isn't wired right " +
-        "after the Random Prompts node.\n\nUnlock them now? Otherwise, they stay locked until the job ends."
+        `The wildcard files have been locked for ${howLong}, and the job is still running without the ` +
+        "Save Workflow (wildcard unlock) node unlocking them. This usually means the unlock node isn't wired right " +
+        "after the Random Prompts node.\n\nRandom Prompts may not have read them yet, so unlocking them now could " +
+        "let a change get into this job without being in its backup.\n\nUnlock them now? Otherwise, they stay " +
+        "locked until the job ends."
     ));
     const unlock = popupButton("Unlock");
     const keep = popupButton("Keep Locked");
@@ -653,7 +659,14 @@ function showLockAsk(detail) {
             body: JSON.stringify({ id }),
         }).catch(() => {});
     });
-    keep.addEventListener("click", close);
+    keep.addEventListener("click", () => {
+        close();
+        api.fetchApi("/brb_save_workflow/keep_locked", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id }),
+        }).catch(() => {});
+    });
 }
 
 function closeLockAsk(detail) {
@@ -681,12 +694,10 @@ function showLockProblem(detail) {
     }
     lockProblemPopup.count += 1;
     const times = lockProblemPopup.count === 1 ? "" : `\n\nThis happened ${lockProblemPopup.count} times.`;
-    const problem = detail?.windows === false
-        ? "Locking only works on Windows, so the wildcard files weren't locked."
-        : `${Number(detail?.failed) || 0} wildcard file(s) couldn't be locked, usually because another program ` +
-          "has them open. They could still be changed before the Random Prompts node reads them.";
     lockProblemPopup.text.textContent =
-        `${problem}\n\nTo stop locking, bypass or remove the Save Workflow (wildcard lock) node.${times}`;
+        `${Number(detail?.failed) || 0} wildcard file(s) couldn't be locked, usually because another program has ` +
+        "them open. They could still be changed before the Random Prompts node reads them.\n\nTo stop locking, " +
+        `turn off wildcard_lock on the Save Workflow (wildcard snapshot) node.${times}`;
 }
 
 // When Random Prompts is used without Dynamic Prompts Wildcard Auto Reload. Like the others, it updates in place
@@ -955,6 +966,29 @@ app.registerExtension({
         });
     },
     beforeRegisterNodeDef(nodeType, nodeData) {
+        if (nodeData.name === SNAPSHOT_NODE_TYPE) {
+            // Where locking isn't available (anywhere but Windows), wildcard_lock is grayed out; the server ignores it.
+            const unavailable = nodeData.input?.required?.wildcard_lock?.[1]?.brb_unavailable === true;
+            if (unavailable) {
+                const onNodeCreated = nodeType.prototype.onNodeCreated;
+                nodeType.prototype.onNodeCreated = function () {
+                    const result = onNodeCreated?.apply(this, arguments);
+                    const widget = findWidget(this, "wildcard_lock");
+                    if (widget) {
+                        widget.value = false;
+                        setDisabled(widget, true);
+                    }
+                    return result;
+                };
+                const onConfigure = nodeType.prototype.onConfigure;
+                nodeType.prototype.onConfigure = function () {
+                    const result = onConfigure?.apply(this, arguments);
+                    setDisabled(findWidget(this, "wildcard_lock"), true);
+                    return result;
+                };
+            }
+            return;
+        }
         if (nodeData.name !== NODE_TYPE) {
             return;
         }

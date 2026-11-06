@@ -259,19 +259,22 @@ def wildcard_backup(wildcards_folder, compression, use_snapshot, prompt):
     return data, "Wildcards: from the folder"
 
 
-# Wildcard locks. When a Save Workflow (wildcard lock) node is in the job, the snapshot node locks the wildcard
-# files before taking its snapshot, so they can't be changed before Random Prompts reads them, and the lock node,
-# wired after Random Prompts, unlocks them. Windows only: elsewhere, locks don't stop other programs.
+# Wildcard locks. With its wildcard_lock setting on, the snapshot node locks the wildcard files before taking its
+# snapshot, so they can't be changed before Random Prompts reads them. A Save Workflow (wildcard unlock) node, wired
+# after Random Prompts, unlocks them; without one, they're unlocked when the job ends. Windows only: elsewhere,
+# locks don't stop other programs.
+LOCKING_AVAILABLE = os.name == "nt"
 LOCK_NODE_TYPE = "BRBSaveWorkflowWildcardLock"
-# While the files are locked, the job is checked once a second. If it was cancelled or failed before the lock node
-# ran, the files are unlocked at once. If it finished without running it, they're unlocked, and a pop-up says so.
-# If it's still running after this many seconds without the lock node having run, a pop-up asks whether to unlock
-# them; until then, they stay locked until the job ends. The next snapshot also unlocks files still locked from an
-# earlier job.
+# While the files are locked, the job is checked once a second, and they're unlocked as soon as it ends. When an
+# unlock node is in the job, a pop-up also says so if the job finished without it running, and asks whether to
+# unlock them if the job is still running after this many seconds without it having run; until then, they stay
+# locked until the job ends. Without an unlock node, they stay locked quietly until the job ends. The next snapshot
+# also unlocks files still locked from an earlier job.
 LOCK_TIMEOUT = 30
 LOCK_CHECK_EVERY = 1.0
 # {"id": ..., "handles": [...], "names": {folder: set of names}, "locked": when, "job": job, "stop": Event,
-#  "asked": whether the pop-up asked to unlock them}
+#  "unlock_node": whether the job has an unlock node, "asked": whether the pop-up is asking to unlock them,
+#  "ask_at": when to ask (again)}
 _lock_state = None
 _lock_guard = threading.Lock()
 
@@ -291,7 +294,7 @@ def _windows_files():
     return kernel32, wintypes.HANDLE(-1).value
 
 
-def lock_folders(sources, job):
+def lock_folders(sources, job, unlock_node=True):
     # Locks every file in the folders: each is opened so other programs can still read it, but not change,
     # rename or delete it. Each is then checked by trying to open it the way an editor saving it would; if that
     # works, it's closed again untouched, and the file counts as not locked. Returns (locked and checked, couldn't
@@ -331,7 +334,7 @@ def lock_folders(sources, job):
                 checked += 1
     state = {
         "id": uuid.uuid4().hex, "handles": handles, "names": names, "locked": time.time(), "job": job,
-        "stop": threading.Event(), "asked": False,
+        "stop": threading.Event(), "unlock_node": unlock_node, "asked": False, "ask_at": time.time() + LOCK_TIMEOUT,
     }
     global _lock_state
     with _lock_guard:
@@ -387,26 +390,28 @@ def job_status(job):
 
 
 def _watch_lock(state):
-    # Unlocks the files once the job is over, if the lock node hasn't unlocked them first, and asks whether to
+    # Unlocks the files once the job is over, if the unlock node hasn't unlocked them first, and asks whether to
     # unlock them if the job runs for too long without it.
     while not state["stop"].wait(LOCK_CHECK_EVERY):
         status = job_status(state["job"])
         if status not in ("stopped", "finished"):
-            if not state["asked"] and time.time() - state["locked"] >= LOCK_TIMEOUT:
+            if state["unlock_node"] and not state["asked"] and time.time() >= state["ask_at"]:
                 state["asked"] = True
-                print(f"{LOG_PREFIX} The wildcard files have been locked for {LOCK_TIMEOUT} seconds without the "
-                      "lock node")
-                send_to_page("brb.save_workflow.lock_ask", {"id": state["id"], "seconds": LOCK_TIMEOUT})
+                seconds = round(time.time() - state["locked"])
+                print(f"{LOG_PREFIX} The wildcard files have been locked for {seconds} seconds without the unlock node")
+                send_to_page("brb.save_workflow.lock_ask", {"id": state["id"], "seconds": seconds})
             continue
         with _lock_guard:
             still_locked = _lock_state is state
         if not still_locked or release_lock() is None:
             return
         if status == "stopped":
-            # Cancelled or failed before the lock node ran: nothing's wrong with the lock.
-            print(f"{LOG_PREFIX} The job stopped before the lock node ran, so the wildcard files were unlocked")
+            # Cancelled or failed before the unlock node ran: nothing's wrong with the lock.
+            print(f"{LOG_PREFIX} The job stopped, so the wildcard files were unlocked")
+        elif not state["unlock_node"]:
+            print(f"{LOG_PREFIX} The job finished, so the wildcard files were unlocked")
         else:
-            print(f"{LOG_PREFIX} The job finished without the lock node running, so the wildcard files were unlocked")
+            print(f"{LOG_PREFIX} The job finished without the unlock node running, so the wildcard files were unlocked")
             send_to_page("brb.save_workflow.lock_timeout", {"reason": "finished"})
         return
 
@@ -972,6 +977,20 @@ def add_routes():
             print(f"{LOG_PREFIX} The wildcard files were unlocked from the pop-up")
         return web.json_response({"ok": True})
 
+    @routes.post("/brb_save_workflow/keep_locked")
+    async def keep_wildcards_locked(request):
+        # Sent when Keep Locked is clicked: asks again after another LOCK_TIMEOUT seconds, if the files are still
+        # locked by then.
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        with _lock_guard:
+            if _lock_state is not None and _lock_state["id"] == data.get("id"):
+                _lock_state["ask_at"] = time.time() + LOCK_TIMEOUT
+                _lock_state["asked"] = False
+        return web.json_response({"ok": True})
+
     @routes.post("/brb_save_workflow/update_extractor")
     async def update_extractor(request):
         # Sent once by the page when the node loads: updates the Workflow Extractor next to a valid archive, if it's
@@ -1164,7 +1183,9 @@ class SaveWorkflow:
     FUNCTION = "save"
     OUTPUT_NODE = True
     CATEGORY = "utils"
-    DESCRIPTION = "Saves the workflow as a .json file, such as next to a video, so it can be opened again later."
+    DESCRIPTION = ("Saves the workflow as a .json file, such as next to a video, so it can be opened again later, or into "
+                   "a compact archive. It can also save text such as prompts into the workflow, and back up the "
+                   "wildcard files the job used.")
 
     def save(self, extension, always_add_counter, api_format_only, format,
              backup_wildcards=False, zip_compression="9", wildcards_folder="wildcards", overwrite=False,
@@ -1311,6 +1332,15 @@ class WildcardSnapshot:
                     "tooltip": "The prompt, sent out unchanged through the prompt_text output. Type it here, or wire it in "
                                "from another node.",
                 }),
+                "wildcard_lock": ("BOOLEAN", {
+                    "default": LOCKING_AVAILABLE,
+                    "tooltip": "On: the wildcard files are locked before the snapshot, so they can't be changed until "
+                               "Random Prompts has read them. A Save Workflow (wildcard unlock) node wired right after "
+                               "Random Prompts unlocks them as soon as it has; without one, they stay locked until the "
+                               "job ends. Off: the files aren't locked. Windows only: elsewhere it's always off.",
+                    # Lets the page gray it out where locking isn't available.
+                    "brb_unavailable": not LOCKING_AVAILABLE,
+                }),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -1325,16 +1355,20 @@ class WildcardSnapshot:
     )
     FUNCTION = "snapshot"
     CATEGORY = "utils"
-    DESCRIPTION = ("Takes a snapshot of the wildcards folder used by each Save Workflow node in the job, just before "
-                   "the wildcards are used, so the wildcard backup matches the files the job really used, even if "
-                   "they're changed while it runs. Wire it in front of the Random Prompts node.")
+    DESCRIPTION = ("Wire this directly in front of the Random Prompts node. It takes a temporary snapshot of the "
+                   "wildcards folder used by each Save Workflow node in the job, just before the wildcards are used, "
+                   "so the wildcard backup matches the files the job really used, even if they're changed while it "
+                   "runs. With "
+                   "wildcard_lock on, it also locks the wildcard files to prevent them from being edited before "
+                   "Random Prompts reads them (Windows only). Wire the Save Workflow (wildcard unlock) node right after "
+                   "the Random Prompts node, to unlock the wildcard files as soon as they have been read by it.")
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
         # Runs on every job, never skipped, so the snapshot is always checked.
         return float("nan")
 
-    def snapshot(self, prompt_text, prompt=None):
+    def snapshot(self, prompt_text, wildcard_lock=True, prompt=None):
         summary = []
         job = current_job(prompt)
         # The wildcards folders of the Save Workflow nodes in this job that back up wildcards from a snapshot.
@@ -1376,24 +1410,24 @@ class WildcardSnapshot:
                            "files until ComfyUI restarts, and the backup may not match what it used")
             send_to_page("brb.save_workflow.reload_missing", {"name": AUTO_RELOAD_NAME, "repo": AUTO_RELOAD_REPO})
 
-        # With a lock node in the job, the files are locked first, so they can't change between the snapshot and
-        # Random Prompts reading them. Files still locked from an earlier job are unlocked either way.
-        locking = any(
-            isinstance(node, dict) and node.get("class_type") == LOCK_NODE_TYPE for node in (prompt or {}).values()
-        )
+        # With wildcard_lock on, the files are locked first, so they can't change between the snapshot and Random
+        # Prompts reading them. Files still locked from an earlier job are unlocked either way.
         sources = [source for folder, source in folders.values() if os.path.isdir(source)]
-        if locking and sources:
-            locked = lock_folders(sources, job)
-            if locked is None:
-                summary.append("Locking only works on Windows, so the wildcard files weren't locked")
-                send_to_page("brb.save_workflow.lock_problem", {"windows": False})
-            else:
+        if wildcard_lock and sources and not LOCKING_AVAILABLE:
+            release_lock()
+            summary.append("Locking is only available on Windows, so the wildcard files weren't locked")
+        elif wildcard_lock and sources:
+            unlock_node = any(
+                isinstance(node, dict) and node.get("class_type") == LOCK_NODE_TYPE for node in (prompt or {}).values()
+            )
+            locked = lock_folders(sources, job, unlock_node)
+            if locked is not None:
                 if locked[0]:
                     summary.append(f"Locked {locked[0]:,} wildcard file(s), and checked that they're locked")
                 if locked[1]:
                     summary.append(f"Couldn't lock {locked[1]:,} wildcard file(s), usually because another program "
                                    "has them open")
-                    send_to_page("brb.save_workflow.lock_problem", {"windows": True, "failed": locked[1]})
+                    send_to_page("brb.save_workflow.lock_problem", {"failed": locked[1]})
         else:
             release_lock()
 
@@ -1442,10 +1476,9 @@ class WildcardLock:
     )
     FUNCTION = "unlock"
     CATEGORY = "utils"
-    DESCRIPTION = ("Wired right after the Random Prompts node, it unlocks the wildcard files the Save Workflow "
-                   "(wildcard snapshot) node locked, once Random Prompts has read them. With this node in the job, "
-                   "the snapshot node locks the files before taking its snapshot, so they can't be changed until "
-                   "Random Prompts has read them. Windows only.")
+    DESCRIPTION = ("Wire this right after the Random Prompts node. It unlocks the wildcard files the Save Workflow "
+                   "(wildcard snapshot) node locked (Windows only), as soon as Random Prompts has read them. Without "
+                   "it, they stay locked until the job ends.")
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -1474,7 +1507,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "BRBSaveWorkflow": "Save Workflow",
     "BRBSaveWorkflowWildcardSnapshot": "Save Workflow (wildcard snapshot)",
-    "BRBSaveWorkflowWildcardLock": "Save Workflow (wildcard lock)",
+    "BRBSaveWorkflowWildcardLock": "Save Workflow (wildcard unlock)",
 }
 
 __all__ = ["WEB_DIRECTORY", "NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

@@ -1,6 +1,6 @@
 [project]
 name = "brb-comfyui-save-workflow"
-version = "1.5.0"
+version = "1.6.0"
 description = "A ComfyUI node that saves your workflow as a .json file with your images or videos, or into a compact archive. It can also save text such as prompts into the workflow, and save a backup of your Dynamic Prompts wildcard files."
 license = { file = "LICENSE" }
 
