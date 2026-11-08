@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import re
+import stat
+import sys
 import threading
 import time
 import uuid
@@ -261,9 +263,34 @@ def wildcard_backup(wildcards_folder, compression, use_snapshot, prompt):
 
 # Wildcard locks. With its wildcard_lock setting on, the snapshot node locks the wildcard files before taking its
 # snapshot, so they can't be changed before Random Prompts reads them. A Save Workflow (wildcard unlock) node, wired
-# after Random Prompts, unlocks them; without one, they're unlocked when the job ends. Windows only: elsewhere,
-# locks don't stop other programs.
-LOCKING_AVAILABLE = os.name == "nt"
+# after Random Prompts, unlocks them; without one, they're unlocked when the job ends.
+# - Windows: each file is held open so other programs can read it but not change, rename or delete it. Windows lets
+#   go of it by itself if ComfyUI stops.
+# - Linux: locks there don't stop other programs, so the files and their folders are made read-only instead, which
+#   also stops editors that save by renaming a new file over the old one.
+# - Mac: the files and folders get the "locked" flag (Finder's Lock checkbox).
+# On Linux and Mac, the original permissions are saved to a file first, and put back the next time ComfyUI starts
+# if it stopped while they were locked. Locking is on by default everywhere.
+LOCK_BY_DEFAULT = True
+MAC_LOCKING = sys.platform == "darwin" and hasattr(os, "chflags")
+# The wildcard_lock tooltip, saying what locking does on the computer ComfyUI runs on, where the files are.
+LOCK_TOOLTIP = (
+    "On: the wildcard files are locked before the snapshot, so they can't be changed until Random Prompts has read "
+    "them. A Save Workflow (wildcard unlock) node wired right after Random Prompts unlocks them as soon as it has; "
+    "without one, they stay locked until the job ends. Off: the files aren't locked."
+)
+if MAC_LOCKING:
+    LOCK_TOOLTIP += (
+        "\n\nOn Mac, locking turns on the locked flag (Finder's Lock checkbox) for the files and all their folders, "
+        "so they can't be changed, renamed, deleted or added to, and turns it back off afterward. If ComfyUI stops "
+        "while they're locked, they stay locked until the next time ComfyUI starts."
+    )
+elif os.name != "nt":
+    LOCK_TOOLTIP += (
+        "\n\nOn Linux, locking makes the files and all their folders read-only, so they can't be changed, renamed, "
+        "deleted or added to, and puts their original permissions back afterward. If ComfyUI stops while they're "
+        "locked, they stay locked until the next time ComfyUI starts."
+    )
 LOCK_NODE_TYPE = "BRBSaveWorkflowWildcardLock"
 # While the files are locked, the job is checked once a second, and they're unlocked as soon as it ends. When an
 # unlock node is in the job, a pop-up also says so if the job finished without it running, and asks whether to
@@ -272,7 +299,8 @@ LOCK_NODE_TYPE = "BRBSaveWorkflowWildcardLock"
 # also unlocks files still locked from an earlier job.
 LOCK_TIMEOUT = 30
 LOCK_CHECK_EVERY = 1.0
-# {"id": ..., "handles": [...], "names": {folder: set of names}, "locked": when, "job": job, "stop": Event,
+# {"id": ..., "handles": [...] (Windows), "records": [...] (Linux and Mac), "count": files locked,
+#  "names": {folder: set of names}, "locked": when, "job": job, "stop": Event,
 #  "unlock_node": whether the job has an unlock node, "asked": whether the pop-up is asking to unlock them,
 #  "ask_at": when to ask (again)}
 _lock_state = None
@@ -294,14 +322,126 @@ def _windows_files():
     return kernel32, wintypes.HANDLE(-1).value
 
 
+def lock_record_file():
+    # Where the original permissions are saved while files are locked on Linux and Mac, in ComfyUI's user folder.
+    return os.path.join(os.path.dirname(failed_list_file()), "wildcard_lock.json")
+
+
+def _restore_permissions(records):
+    # Puts back the permissions in records, saved as (path, "mode" or "flags", original value, is folder), folders
+    # first. Returns how many couldn't be put back.
+    failures = 0
+    for path, kind, value, is_folder in sorted(records, key=lambda record: not record[3]):
+        try:
+            if kind == "flags":
+                os.chflags(path, value)
+            else:
+                os.chmod(path, value)
+        except (OSError, AttributeError):
+            failures += 1
+    return failures
+
+
+def _posix_lock(sources):
+    # Linux and Mac: makes the files and their folders read-only (Linux) or locked (Mac), after saving their
+    # original permissions to the lock record file. Each file and folder is then checked by reading its permissions
+    # back, which catches drives that accept the change but ignore it. A file counts as not locked if it or its
+    # folder isn't. (Trying to write instead would always work when ComfyUI runs as the administrator, even though
+    # the files are locked for everyone else.) Returns (records, names, files locked and checked, files that
+    # couldn't be locked).
+    names = {}
+    paths = []
+    for source in sources:
+        try:
+            files = archiving.folder_files(source)
+            folders = [dirpath for dirpath, dirnames, filenames in os.walk(source)]
+        except OSError:
+            continue
+        names[source] = {name for name, full_path in files}
+        paths += [(full_path, False) for name, full_path in files] + [(folder, True) for folder in folders]
+    records = []
+    for path, is_folder in paths:
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        if MAC_LOCKING:
+            records.append((path, "flags", info.st_flags, is_folder))
+        else:
+            records.append((path, "mode", stat.S_IMODE(info.st_mode), is_folder))
+    # Saved before anything is changed, so if ComfyUI stops while they're locked, they can be unlocked at its next
+    # start.
+    record_file = lock_record_file()
+    try:
+        os.makedirs(os.path.dirname(record_file), exist_ok=True)
+        temp = f"{record_file}.{uuid.uuid4().hex}.tmp"
+        with open(temp, "w", encoding="utf-8") as file:
+            json.dump(records, file)
+        os.replace(temp, record_file)
+    except OSError as error:
+        print(f"{LOG_PREFIX} Couldn't save the wildcard files' permissions, so they weren't locked: {reason(error)}")
+        files = sum(1 for record in records if not record[3])
+        return [], names, 0, files
+    not_locked = set()
+    for path, kind, value, is_folder in records:
+        try:
+            if kind == "flags":
+                os.chflags(path, value | stat.UF_IMMUTABLE)
+            else:
+                os.chmod(path, value & ~0o222)
+        except OSError:
+            not_locked.add(path)
+    for path, kind, value, is_folder in records:
+        if path in not_locked:
+            continue
+        try:
+            info = os.stat(path)
+            locked = (info.st_flags & stat.UF_IMMUTABLE) if kind == "flags" else not (info.st_mode & 0o222)
+        except OSError:
+            locked = False
+        if not locked:
+            not_locked.add(path)
+    checked = 0
+    failed = 0
+    for path, kind, value, is_folder in records:
+        if is_folder:
+            continue
+        if path in not_locked or os.path.dirname(path) in not_locked:
+            failed += 1
+        else:
+            checked += 1
+    return records, names, checked, failed
+
+
+def restore_left_locks():
+    # At startup: unlocks wildcard files left locked when ComfyUI last stopped, on Linux and Mac.
+    record_file = lock_record_file()
+    if not os.path.exists(record_file):
+        return
+    try:
+        with open(record_file, encoding="utf-8") as file:
+            records = [tuple(record) for record in json.load(file)]
+    except (OSError, ValueError):
+        records = []
+    failures = _restore_permissions(records)
+    try:
+        os.remove(record_file)
+    except OSError:
+        pass
+    print(f"{LOG_PREFIX} Unlocked the wildcard files left locked when ComfyUI last stopped"
+          + (f", except {failures}" if failures else ""))
+
+
 def lock_folders(sources, job, unlock_node=True):
-    # Locks every file in the folders: each is opened so other programs can still read it, but not change,
-    # rename or delete it. Each is then checked by trying to open it the way an editor saving it would; if that
-    # works, it's closed again untouched, and the file counts as not locked. Returns (locked and checked, couldn't
-    # be locked), or None when locking isn't available here.
-    if os.name != "nt":
-        return None
+    # Locks every file in the folders (see above). On Windows, each is opened so other programs can still read
+    # it, but not change, rename or delete it. Each is then checked by trying to open it the way an editor saving
+    # it would; if that works, it's closed again untouched, and the file counts as not locked. Returns (locked and
+    # checked, couldn't be locked).
     release_lock()
+    if os.name != "nt":
+        records, names, checked, failed = _posix_lock(sources)
+        return _start_lock({"handles": [], "records": records, "names": names, "count": checked + failed},
+                           job, unlock_node, checked, failed)
     kernel32, invalid = _windows_files()
     generic_read, share_read, open_existing, normal = 0x80000000, 0x1, 3, 0x80
     generic_write, delete_access, share_all = 0x40000000, 0x10000, 0x7
@@ -332,10 +472,15 @@ def lock_folders(sources, job, unlock_node=True):
                 failed += 1
             else:
                 checked += 1
-    state = {
-        "id": uuid.uuid4().hex, "handles": handles, "names": names, "locked": time.time(), "job": job,
-        "stop": threading.Event(), "unlock_node": unlock_node, "asked": False, "ask_at": time.time() + LOCK_TIMEOUT,
-    }
+    return _start_lock({"handles": handles, "records": [], "names": names, "count": len(handles)},
+                       job, unlock_node, checked, failed)
+
+
+def _start_lock(state, job, unlock_node, checked, failed):
+    state.update({
+        "id": uuid.uuid4().hex, "locked": time.time(), "job": job, "stop": threading.Event(),
+        "unlock_node": unlock_node, "asked": False, "ask_at": time.time() + LOCK_TIMEOUT,
+    })
     global _lock_state
     with _lock_guard:
         _lock_state = state
@@ -354,12 +499,23 @@ def release_lock():
     if state["asked"]:
         # The pop-up asking whether to unlock them closes by itself.
         send_to_page("brb.save_workflow.lock_released", {"id": state["id"]})
-    try:
-        kernel32, invalid = _windows_files()
-        for handle in state["handles"]:
-            kernel32.CloseHandle(handle)
-    except Exception:
-        pass
+    if state["handles"]:
+        try:
+            kernel32, invalid = _windows_files()
+            for handle in state["handles"]:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+    if state["records"]:
+        failures = _restore_permissions(state["records"])
+        if failures:
+            # Left in the record file, so the next start tries again.
+            print(f"{LOG_PREFIX} Couldn't unlock {failures} wildcard file(s) or folder(s)")
+        else:
+            try:
+                os.remove(lock_record_file())
+            except OSError:
+                pass
     # Files added while locked couldn't be locked, so Random Prompts may have read them.
     new = 0
     for source, names in state["names"].items():
@@ -367,7 +523,7 @@ def release_lock():
             new += sum(1 for name, full_path in archiving.folder_files(source) if name not in names)
         except OSError:
             pass
-    return len(state["handles"]), time.time() - state["locked"], new
+    return state["count"], time.time() - state["locked"], new
 
 
 def job_status(job):
@@ -1333,13 +1489,8 @@ class WildcardSnapshot:
                                "from another node.",
                 }),
                 "wildcard_lock": ("BOOLEAN", {
-                    "default": LOCKING_AVAILABLE,
-                    "tooltip": "On: the wildcard files are locked before the snapshot, so they can't be changed until "
-                               "Random Prompts has read them. A Save Workflow (wildcard unlock) node wired right after "
-                               "Random Prompts unlocks them as soon as it has; without one, they stay locked until the "
-                               "job ends. Off: the files aren't locked. Windows only: elsewhere it's always off.",
-                    # Lets the page gray it out where locking isn't available.
-                    "brb_unavailable": not LOCKING_AVAILABLE,
+                    "default": LOCK_BY_DEFAULT,
+                    "tooltip": LOCK_TOOLTIP,
                 }),
             },
             "hidden": {
@@ -1360,7 +1511,7 @@ class WildcardSnapshot:
                    "so the wildcard backup matches the files the job really used, even if they're changed while it "
                    "runs. With "
                    "wildcard_lock on, it also locks the wildcard files to prevent them from being edited before "
-                   "Random Prompts reads them (Windows only). Wire the Save Workflow (wildcard unlock) node right after "
+                   "Random Prompts reads them. Wire the Save Workflow (wildcard unlock) node right after "
                    "the Random Prompts node, to unlock the wildcard files as soon as they have been read by it.")
 
     @classmethod
@@ -1413,21 +1564,18 @@ class WildcardSnapshot:
         # With wildcard_lock on, the files are locked first, so they can't change between the snapshot and Random
         # Prompts reading them. Files still locked from an earlier job are unlocked either way.
         sources = [source for folder, source in folders.values() if os.path.isdir(source)]
-        if wildcard_lock and sources and not LOCKING_AVAILABLE:
-            release_lock()
-            summary.append("Locking is only available on Windows, so the wildcard files weren't locked")
-        elif wildcard_lock and sources:
+        if wildcard_lock and sources:
             unlock_node = any(
                 isinstance(node, dict) and node.get("class_type") == LOCK_NODE_TYPE for node in (prompt or {}).values()
             )
             locked = lock_folders(sources, job, unlock_node)
-            if locked is not None:
-                if locked[0]:
-                    summary.append(f"Locked {locked[0]:,} wildcard file(s), and checked that they're locked")
-                if locked[1]:
-                    summary.append(f"Couldn't lock {locked[1]:,} wildcard file(s), usually because another program "
-                                   "has them open")
-                    send_to_page("brb.save_workflow.lock_problem", {"failed": locked[1]})
+            if locked[0]:
+                summary.append(f"Locked {locked[0]:,} wildcard file(s), and checked that they're locked")
+            if locked[1]:
+                why = ("usually because another program has them open" if os.name == "nt"
+                       else "usually because they belong to another user, or their drive doesn't support permissions")
+                summary.append(f"Couldn't lock {locked[1]:,} wildcard file(s), {why}")
+                send_to_page("brb.save_workflow.lock_problem", {"failed": locked[1], "why": why})
         else:
             release_lock()
 
@@ -1477,8 +1625,8 @@ class WildcardLock:
     FUNCTION = "unlock"
     CATEGORY = "utils"
     DESCRIPTION = ("Wire this right after the Random Prompts node. It unlocks the wildcard files the Save Workflow "
-                   "(wildcard snapshot) node locked (Windows only), as soon as Random Prompts has read them. Without "
-                   "it, they stay locked until the job ends.")
+                   "(wildcard snapshot) node locked, as soon as Random Prompts has read them. Without it, they stay "
+                   "locked until the job ends.")
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -1497,6 +1645,12 @@ class WildcardLock:
                                "couldn't be locked, and the backup may not match what Random Prompts read")
         return (prompt_text, "\n\n".join(summary))
 
+
+# Files left locked when ComfyUI last stopped, on Linux and Mac, are unlocked as it starts.
+try:
+    restore_left_locks()
+except Exception as error:
+    print(f"{LOG_PREFIX} Couldn't check for wildcard files left locked: {type(error).__name__}")
 
 NODE_CLASS_MAPPINGS = {
     "BRBSaveWorkflow": SaveWorkflow,

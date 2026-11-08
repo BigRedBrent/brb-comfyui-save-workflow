@@ -16,7 +16,6 @@ import { ComfyWidgets } from "../../scripts/widgets.js";
 //   Nothing is ever written to the browser's console.
 
 const NODE_TYPE = "BRBSaveWorkflow";
-const SNAPSHOT_NODE_TYPE = "BRBSaveWorkflowWildcardSnapshot";
 
 // Height of the empty space between "format" and "backup_wildcards".
 const GAP_HEIGHT = 10;
@@ -695,8 +694,9 @@ function showLockProblem(detail) {
     lockProblemPopup.count += 1;
     const times = lockProblemPopup.count === 1 ? "" : `\n\nThis happened ${lockProblemPopup.count} times.`;
     lockProblemPopup.text.textContent =
-        `${Number(detail?.failed) || 0} wildcard file(s) couldn't be locked, usually because another program has ` +
-        "them open. They could still be changed before the Random Prompts node reads them.\n\nTo stop locking, " +
+        `${Number(detail?.failed) || 0} wildcard file(s) couldn't be locked, ` +
+        `${detail?.why || "usually because another program has them open"}. They could still be changed before ` +
+        "the Random Prompts node reads them.\n\nTo stop locking, " +
         `turn off wildcard_lock on the Save Workflow (wildcard snapshot) node.${times}`;
 }
 
@@ -966,29 +966,6 @@ app.registerExtension({
         });
     },
     beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name === SNAPSHOT_NODE_TYPE) {
-            // Where locking isn't available (anywhere but Windows), wildcard_lock is grayed out; the server ignores it.
-            const unavailable = nodeData.input?.required?.wildcard_lock?.[1]?.brb_unavailable === true;
-            if (unavailable) {
-                const onNodeCreated = nodeType.prototype.onNodeCreated;
-                nodeType.prototype.onNodeCreated = function () {
-                    const result = onNodeCreated?.apply(this, arguments);
-                    const widget = findWidget(this, "wildcard_lock");
-                    if (widget) {
-                        widget.value = false;
-                        setDisabled(widget, true);
-                    }
-                    return result;
-                };
-                const onConfigure = nodeType.prototype.onConfigure;
-                nodeType.prototype.onConfigure = function () {
-                    const result = onConfigure?.apply(this, arguments);
-                    setDisabled(findWidget(this, "wildcard_lock"), true);
-                    return result;
-                };
-            }
-            return;
-        }
         if (nodeData.name !== NODE_TYPE) {
             return;
         }
