@@ -496,7 +496,7 @@ def _store_once(archive, reader, items, count_step, message, skip_identical):
     # Every object written by this save, to check afterward: {id: (kind, data)}.
     written = {}
     # Files the archive's newest entry already holds, in the folders read for this save. Only these are reused
-    # without writing them again: anything else could be removed and scrubbed at this very moment, so it's written
+    # without writing them again: anything else could be removed and purged at this very moment, so it's written
     # as its own file, which no cleanup deletes while it's new.
     def held(entries):
         return {sha for mode, sha in entries.values() if mode != "40000"}
@@ -544,7 +544,7 @@ def _store_once(archive, reader, items, count_step, message, skip_identical):
     written[commit] = ("commit", data)
     update_head(archive, commit, parent)
 
-    # Check every file just written. One deleted at that exact moment, like by the Workflow Extractor scrubbing
+    # Check every file just written. One deleted at that exact moment, like by the Workflow Extractor purging
     # removed files, is written again.
     for sha, (kind, data) in written.items():
         if object_file_is_intact(archive, sha) or reader.exists(sha):
@@ -843,12 +843,12 @@ def run_watched(archive, args, text, progress, should_stop, started):
         raise ArchiveError(f"Git stopped with an error: {detail}")
 
 
-def compress(archive, progress=None, rebuild=False, should_stop=None, scrub=False):
+def compress(archive, progress=None, rebuild=False, should_stop=None, purge=False):
     # Compresses the archive: clears its history, so nothing old is kept for it, then packs everything into one
     # storage file. A rebuild redoes every match from scratch, for the smallest archive, then checks everything is
     # intact. Saves made meanwhile are safe: new files are only deleted by a later compression once they're 27
     # hours old and still unused, and the history is only replaced if nothing else changed it meanwhile.
-    # With scrub, every unused leftover is deleted at the end, however new, while saves in this ComfyUI wait;
+    # With purge, every unused leftover is deleted at the end, however new, while saves in this ComfyUI wait;
     # another program saving to the archive at that moment could lose what it saved.
     # Returns True if it ran, or False if another compression of this archive was already running.
     lock = compress_lock(archive)
@@ -878,11 +878,11 @@ def compress(archive, progress=None, rebuild=False, should_stop=None, scrub=Fals
         if rebuild:
             run_watched(archive, ["fsck", "--no-dangling", "--no-progress"], "Checking the archive...", progress,
                         should_stop, time.time())
-        if scrub:
+        if purge:
             # Saves wait for this, so none of their new files, not yet part of the archive, can be deleted with
             # the leftovers.
             with store_lock(archive):
-                run_watched(archive, ["prune", "--expire=now"], "Scrubbing leftover data...", progress, should_stop,
+                run_watched(archive, ["prune", "--expire=now"], "Purging leftover data...", progress, should_stop,
                             time.time())
         if progress:
             progress("Rebuilt" if rebuild else "Compressed", 1.0)
@@ -907,7 +907,7 @@ def leftover_size(archive):
     return total, count
 
 
-def scrub(archive, progress=None, should_stop=None):
+def purge(archive, progress=None, should_stop=None):
     # Deletes all leftover data right away, however new. Saves in this ComfyUI wait while it runs, so none of their
     # new data, not yet part of the archive, can be deleted with it; another program using the archive at that
     # moment could lose what it saved. Returns True if it ran, or False if the archive was being compressed.
@@ -916,10 +916,10 @@ def scrub(archive, progress=None, should_stop=None):
         return False
     try:
         with store_lock(archive):
-            run_watched(archive, ["prune", "--expire=now"], "Scrubbing leftover data...", progress, should_stop,
+            run_watched(archive, ["prune", "--expire=now"], "Purging leftover data...", progress, should_stop,
                         time.time())
         if progress:
-            progress("Scrubbed", 1.0)
+            progress("Purged", 1.0)
         return True
     finally:
         lock.release()

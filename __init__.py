@@ -957,7 +957,7 @@ _tasks = {}
 _tasks_lock = threading.Lock()
 
 
-def run_task(action, archive, scrub=False):
+def run_task(action, archive, purge=False):
     output = output_folder()
     task = {
         "text": "Starting...", "fraction": None, "done": False, "error": None, "result": None, "archive": archive,
@@ -998,32 +998,32 @@ def run_task(action, archive, scrub=False):
     def work():
         task["thread"] = threading.get_native_id()
         try:
-            if action == "scrub":
+            if action == "purge":
                 size_before = archiving.archive_size(archive)
-                scrub_started = time.time()
-                if not archiving.scrub(archive, progress, should_stop=should_stop):
+                purge_started = time.time()
+                if not archiving.purge(archive, progress, should_stop=should_stop):
                     raise archiving.ArchiveError(
                         "The archive is being compressed right now. Try again once that's done."
                     )
                 size_after = archiving.archive_size(archive)
                 task["result"] = (
-                    "The leftover data was scrubbed.\n\n"
-                    f"Time to scrub: {archiving.duration(time.time() - scrub_started)}\n\n"
-                    f"Archive size before scrub: {archiving.size_text(size_before)}\n"
-                    f"Archive size after scrub: {archiving.size_text(size_after)}"
+                    "The leftover data was purged.\n\n"
+                    f"Time to purge: {archiving.duration(time.time() - purge_started)}\n\n"
+                    f"Archive size before purge: {archiving.size_text(size_before)}\n"
+                    f"Archive size after purge: {archiving.size_text(size_after)}"
                 )
                 return
             if action == "rebuild":
                 size_before = archiving.archive_size(archive)
                 rebuild_started = time.time()
-                if not archiving.compress(archive, progress, rebuild=True, should_stop=should_stop, scrub=scrub):
+                if not archiving.compress(archive, progress, rebuild=True, should_stop=should_stop, purge=purge):
                     raise archiving.ArchiveError(
                         "The archive is being compressed right now. Try again once that's done."
                     )
                 size_after = archiving.archive_size(archive)
                 task["result"] = (
                     "The archive was rebuilt and checked, and everything in it is intact."
-                    + (" Leftover data was scrubbed." if scrub else "") + "\n\n"
+                    + (" Leftover data was purged." if purge else "") + "\n\n"
                     f"Time to rebuild: {archiving.duration(time.time() - rebuild_started)}\n\n"
                     f"Archive size before rebuild: {archiving.size_text(size_before)}\n"
                     f"Archive size after rebuild: {archiving.size_text(size_after)}"
@@ -1118,7 +1118,7 @@ def add_routes():
         except Exception:
             data = {}
         action = data.get("action")
-        if action not in ("create", "retry_failed", "archive_all", "rebuild", "scrub"):
+        if action not in ("create", "retry_failed", "archive_all", "rebuild", "purge"):
             return web.json_response({"error": "Unknown action."})
         archive = archive_folder_for(data.get("archive_path"))
         if action == "create":
@@ -1134,7 +1134,7 @@ def add_routes():
             archiving.open_archive(archive, create=False)
         except archiving.ArchiveError as error:
             return web.json_response({"error": str(error)})
-        return web.json_response({"task": run_task(action, archive, scrub=action == "rebuild" and data.get("scrub") is True)})
+        return web.json_response({"task": run_task(action, archive, purge=action == "rebuild" and data.get("purge") is True)})
 
     @routes.post("/brb_save_workflow/unlock")
     async def unlock_wildcards(request):
@@ -1151,7 +1151,7 @@ def add_routes():
 
     @routes.post("/brb_save_workflow/leftovers")
     async def leftovers(request):
-        # Sent by the Scrub Archive button first: how much leftover data there is to scrub.
+        # Sent by the Purge Archive button first: how much leftover data there is to purge.
         try:
             data = await request.json()
         except Exception:

@@ -10,9 +10,9 @@ import { ComfyWidgets } from "../../scripts/widgets.js";
 // - Each text input that's connected, or has text from an opened workflow file, gets a read-only box at the
 //   bottom showing its text. The box is labeled like its input, so renaming an input renames its box.
 // - The archive settings sit below a gap, with the Create Archive, Retry Failed Archiving, Archive All and Rebuild
-//   Archive and Scrub Archive buttons under them, and "keep_text" below those. While "archive" is on, "zip_compression" and "overwrite" are grayed
+//   Archive and Purge Archive buttons under them, and "keep_text" below those. While "archive" is on, "zip_compression" and "overwrite" are grayed
 //   out (they keep their values, which are ignored). The buttons always work, whether "archive" is on or off.
-// - Pop-ups: when archiving fails, while a button's task runs, and to confirm Archive All, Rebuild Archive and Scrub Archive.
+// - Pop-ups: when archiving fails, while a button's task runs, and to confirm Archive All, Rebuild Archive and Purge Archive.
 //   Nothing is ever written to the browser's console.
 
 const NODE_TYPE = "BRBSaveWorkflow";
@@ -45,7 +45,7 @@ const BUTTONS = [
     { label: "Retry Failed Archiving", action: "retry_failed" },
     { label: "Archive All", action: "archive_all" },
     { label: "Rebuild Archive", action: "rebuild" },
-    { label: "Scrub Archive", action: "scrub" },
+    { label: "Purge Archive", action: "purge" },
 ];
 
 // The color of the progress bar in the task pop-up.
@@ -732,14 +732,14 @@ function showReloadMissing(detail) {
         `Install ${name} (${repo}) so edited wildcard files are used on the next run.${times}`;
 }
 
-// The rebuild confirmation's "Scrub immediately" checkbox, off each time, shown just above the text box like the
+// The rebuild confirmation's "Purge immediately" checkbox, off each time, shown just above the text box like the
 // Workflow Extractor's, with the same tooltip layout. prompt is the line asking for the word, kept right above the
 // text box.
-const SCRUB_TOOLTIP = [
+const PURGE_TOOLTIP = [
     // [text, bold, extra space above, centered]
     [
-        "Scrubs leftover data from the archive right after rebuilding: old copies that are no longer used. If a job " +
-            "saves to the archive while it's scrubbing, the save waits until the scrub is done. This, however, doesn't " +
+        "Purges leftover data from the archive right after rebuilding: old copies that are no longer used. If a job " +
+            "saves to the archive while it's purging, the save waits until the purge is done. This, however, doesn't " +
             "stop saves from another copy of ComfyUI, or files being deleted with the Workflow Extractor.",
         false, false, false,
     ],
@@ -751,7 +751,7 @@ const SCRUB_TOOLTIP = [
         true, false, false,
     ],
     [
-        "Otherwise, the leftover data is scrubbed by a later compression operation: the first one that happens at " +
+        "Otherwise, the leftover data is purged by a later compression operation: the first one that happens at " +
             "least 27 hours after it was replaced.",
         false, true, false,
     ],
@@ -812,28 +812,28 @@ function formattedText(parts) {
     return element;
 }
 
-// The Scrub Archive confirmation's explanation and warning, laid out the same way as the rebuild's tooltip.
-const SCRUB_ARCHIVE_TEXT = [
+// The Purge Archive confirmation's explanation and warning, laid out the same way as the rebuild's tooltip.
+const PURGE_ARCHIVE_TEXT = [
     [
-        "Scrubbing deletes it now, instead of waiting for a later compression. If a job saves to the archive while " +
-            "it's scrubbing, the save waits until the scrub is done. This, however, doesn't stop saves from another " +
+        "Purging deletes it now, instead of waiting for a later compression. If a job saves to the archive while " +
+            "it's purging, the save waits until the purge is done. This, however, doesn't stop saves from another " +
             "copy of ComfyUI, or files being deleted with the Workflow Extractor.",
         false, false, false,
     ],
-    SCRUB_TOOLTIP[1],
-    SCRUB_TOOLTIP[2],
-    ["Type scrub to continue:", false, true, false],
+    PURGE_TOOLTIP[1],
+    PURGE_TOOLTIP[2],
+    ["Type purge to continue:", false, true, false],
 ];
 
-function scrubOption(prompt) {
+function purgeOption(prompt) {
     const element = document.createElement("div");
     element.style.marginTop = "12px";
     const label = document.createElement("label");
     Object.assign(label.style, { display: "inline-flex", alignItems: "center", gap: "8px", cursor: "pointer" });
     const box = document.createElement("input");
     box.type = "checkbox";
-    label.append(box, document.createTextNode("Scrub immediately"));
-    addTooltip(label, SCRUB_TOOLTIP);
+    label.append(box, document.createTextNode("Purge immediately"));
+    addTooltip(label, PURGE_TOOLTIP);
     element.appendChild(label);
     const ask = popupText(prompt);
     ask.style.marginTop = "12px";
@@ -849,7 +849,7 @@ async function runTask(node, action, options = {}) {
         response = await (await api.fetchApi("/brb_save_workflow/task", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action, archive_path: archivePath, scrub: options.scrub === true }),
+            body: JSON.stringify({ action, archive_path: archivePath, purge: options.purge === true }),
         })).json();
     } catch {
         messagePopup("Couldn't reach ComfyUI to start this. Make sure it's still running.");
@@ -867,7 +867,7 @@ async function runTask(node, action, options = {}) {
 
     const titles = {
         retry_failed: "Retry Failed Archiving", archive_all: "Archive All", rebuild: "Rebuild Archive",
-        scrub: "Scrub Archive",
+        purge: "Purge Archive",
     };
     const title = titles[action] || "Save Workflow";
     const { holder, box, bar } = floatingPopup(title);
@@ -911,8 +911,8 @@ async function runTask(node, action, options = {}) {
         // What stopping means for each task.
         const afterStopping = action === "rebuild"
             ? "The archive stays as it was before the rebuild."
-            : action === "scrub"
-                ? "Leftover data already scrubbed stays gone, and the rest stays until a later compression."
+            : action === "purge"
+                ? "Leftover data already purged stays gone, and the rest stays until a later compression."
                 : "Files already stored stay in the archive, and the rest stay in their folders.";
         const sure = await confirmPopup(
             `Are you sure?\n\n${title} will be stopped.\n${afterStopping}`,
@@ -1014,8 +1014,8 @@ async function onArchiveButton(node, action) {
         if (!sure) {
             return;
         }
-    } else if (action === "scrub") {
-        // First, how much there is to scrub.
+    } else if (action === "purge") {
+        // First, how much there is to purge.
         const archivePath = findWidget(node, "archive_path")?.value ?? ".workflows";
         let found;
         try {
@@ -1033,16 +1033,16 @@ async function onArchiveButton(node, action) {
             return;
         }
         if (!found.bytes) {
-            messagePopup(`There's no leftover data to scrub.\n\nArchive size: ${found.archive_size}`);
+            messagePopup(`There's no leftover data to purge.\n\nArchive size: ${found.archive_size}`);
             return;
         }
         const typed = await confirmPopup(
             `About ${found.size} of leftover data is waiting to be removed: old copies that are no longer used.`,
             "Continue",
-            "scrub",
+            "purge",
             false,
             null,
-            formattedText(SCRUB_ARCHIVE_TEXT)
+            formattedText(PURGE_ARCHIVE_TEXT)
         );
         if (!typed) {
             return;
@@ -1057,7 +1057,7 @@ async function onArchiveButton(node, action) {
             return;
         }
     } else if (action === "rebuild") {
-        const scrub = scrubOption("Type rebuild to continue:");
+        const purge = purgeOption("Type rebuild to continue:");
         const typed = await confirmPopup(
             "Rebuild Archive redoes the compression of the whole archive from scratch, for the smallest size, then " +
                 "checks that everything in it is intact. It can take a long time for a big archive, and " +
@@ -1067,12 +1067,12 @@ async function onArchiveButton(node, action) {
             "rebuild",
             false,
             null,
-            scrub.element
+            purge.element
         );
         if (!typed) {
             return;
         }
-        options.scrub = scrub.checked();
+        options.purge = purge.checked();
         const sure = await confirmPopup(
             "Are you sure?\n\nThe whole archive will be rebuilt, which can take a long time for a big archive.",
             "Continue",

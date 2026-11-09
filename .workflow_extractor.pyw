@@ -54,10 +54,10 @@ MARKER_VALUE = "1"
 # Where Save Workflow keeps its count of saves since the last compression.
 BOOKMARK_REF = "refs/workflowarchive/compressed"
 
-# Shown when hovering over the "Scrub immediately" box.
-SCRUB_TOOLTIP = [
+# Shown when hovering over the "Purge immediately" box.
+PURGE_TOOLTIP = [
     # (text, bold, extra space above, centered)
-    ("Scrubs the deleted files’ data from the archive right away.", False, False, False),
+    ("Purges the deleted files’ data from the archive right away.", False, False, False),
     ("WARNING!!!", True, True, True),
     (
         "Only use this while nothing else is using the archive: if ComfyUI saves to it at the same moment, the files "
@@ -67,7 +67,7 @@ SCRUB_TOOLTIP = [
         False,
     ),
     (
-        "Otherwise, the data is scrubbed by a later compression operation: usually the next one, or for files saved "
+        "Otherwise, the data is purged by a later compression operation: usually the next one, or for files saved "
         "since the last compression, the first compression that happens at least 27 hours after they were saved.",
         False,
         True,
@@ -77,7 +77,7 @@ SCRUB_TOOLTIP = [
 
 TITLE = "Workflow Extractor"
 # The extractor's own version, separate from Save Workflow's; bumped only when the extractor itself changes.
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 
 def window_title(archive):
@@ -314,7 +314,7 @@ def extract(archive, entries, folder, progress):
     return saved
 
 
-def delete(archive, entries, scrub, progress):
+def delete(archive, entries, purge, progress):
     to_delete = {entry.stored for entry in entries}
     env = dict(os.environ)
     env.update(GIT_IDENTITY)
@@ -347,8 +347,8 @@ def delete(archive, entries, scrub, progress):
     run_git(archive, ["update-ref", BOOKMARK_REF, commit])
     run_git(archive, ["reflog", "expire", "--expire=now", "--all"])
 
-    if scrub:
-        progress("Scrubbing the deleted files’ data. This can take a minute...")
+    if purge:
+        progress("Purging the deleted files’ data. This can take a minute...")
         run_git(archive, ["repack", "-a", "-d", "-q"])
         run_git(archive, ["prune", "--expire=now"])
 
@@ -1031,7 +1031,7 @@ class ExtractorWindow:
         dialog.title("Confirm Delete")
         dialog.transient(self.root)
         dialog.resizable(False, False)
-        result = {"confirmed": False, "scrub": False}
+        result = {"confirmed": False, "purge": False}
 
         frame = ttk.Frame(dialog, padding=14)
         frame.pack(fill="both", expand=True)
@@ -1042,10 +1042,10 @@ class ExtractorWindow:
             justify="left",
         ).pack(anchor="w")
 
-        scrub = tk.BooleanVar(value=False)
-        scrub_box = ttk.Checkbutton(frame, text="Scrub immediately", variable=scrub)
-        scrub_box.pack(anchor="w", pady=(12, 0))
-        Tooltip(scrub_box, SCRUB_TOOLTIP)
+        purge = tk.BooleanVar(value=False)
+        purge_box = ttk.Checkbutton(frame, text="Purge immediately", variable=purge)
+        purge_box.pack(anchor="w", pady=(12, 0))
+        Tooltip(purge_box, PURGE_TOOLTIP)
 
         ttk.Label(frame, text="Type DELETE to confirm:").pack(anchor="w", pady=(12, 2))
         typed = tk.StringVar()
@@ -1059,7 +1059,7 @@ class ExtractorWindow:
         def do_delete():
             if typed.get() == "DELETE":
                 result["confirmed"] = True
-                result["scrub"] = scrub.get()
+                result["purge"] = purge.get()
                 dialog.destroy()
 
         # Delete in the middle, Cancel at the far right.
@@ -1078,7 +1078,7 @@ class ExtractorWindow:
         y = self.root.winfo_rooty() + (self.root.winfo_height() - dialog.winfo_height()) // 3
         dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
         self.show_dialog(dialog, entry)
-        return result["confirmed"], result["scrub"]
+        return result["confirmed"], result["purge"]
 
     def delete_all(self):
         self.delete_entries(list(self.matches))
@@ -1089,11 +1089,11 @@ class ExtractorWindow:
     def delete_entries(self, entries):
         if not entries or self.busy:
             return
-        confirmed, scrub = self.confirm_delete(entries)
+        confirmed, purge = self.confirm_delete(entries)
         # One last chance to back out.
         if confirmed:
             count = len(entries)
-            note = "\nTheir data will be scrubbed right away." if scrub else ""
+            note = "\nTheir data will be purged right away." if purge else ""
             confirmed = self.confirm(
                 "Confirm Delete",
                 f"Are you sure?\n\n{count:,} file{'' if count == 1 else 's'} will be permanently deleted from the "
@@ -1108,10 +1108,10 @@ class ExtractorWindow:
         def done(deleted):
             # Search again, so the list shows what's left.
             self.search()
-            note = " Their data was scrubbed." if scrub else ""
+            note = " Their data was purged." if purge else ""
             self.message(f"Deleted {deleted:,} file(s) from the archive.{note}")
 
-        self.run_in_background(lambda progress: delete(self.archive, entries, scrub, progress), done, "Deleting...")
+        self.run_in_background(lambda progress: delete(self.archive, entries, purge, progress), done, "Deleting...")
 
 
 # Kept for as long as the window is open, so Windows knows this archive is already open in the Workflow Extractor.
