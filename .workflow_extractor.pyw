@@ -76,6 +76,13 @@ SCRUB_TOOLTIP = [
 ]
 
 TITLE = "Workflow Extractor"
+# The extractor's own version, separate from Save Workflow's; bumped only when the extractor itself changes.
+VERSION = "1.0.0"
+
+
+def window_title(archive):
+    # Like "Workflow Extractor 1.7.1: .workflows". Also used to find this archive's window when it's already open.
+    return f"{TITLE} {VERSION}: {archive.name}"
 
 BASE = Path(__file__).resolve().parent
 
@@ -371,7 +378,9 @@ class Tooltip:
         widget.bind("<Leave>", self.hide)
 
     def schedule(self, _event=None):
-        self.pending = self.widget.after(400, self.show)
+        # Shown straight away, and hidden when the mouse leaves. It only reacts to the mouse entering and leaving,
+        # so it does no work otherwise.
+        self.show()
 
     def show(self):
         if self.window:
@@ -594,7 +603,7 @@ class ExtractorWindow:
         self.sort_reversed = {"name": False, "date": False}
         self.progress_text = None
         self.results_queue = queue.Queue()
-        root.title(f"{TITLE}: {archive.name}")
+        root.title(window_title(archive))
         root.geometry("1140x520")
         root.minsize(640, 320)
 
@@ -1132,7 +1141,7 @@ def claim_archive(archive):
     user32.IsIconic.argtypes = (wintypes.HWND,)
     user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
     user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
-    window = user32.FindWindowW(None, f"{TITLE}: {archive.name}")
+    window = user32.FindWindowW(None, window_title(archive))
     if window:
         if user32.IsIconic(window):
             user32.ShowWindow(window, 9)

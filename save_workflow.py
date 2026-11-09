@@ -843,11 +843,13 @@ def run_watched(archive, args, text, progress, should_stop, started):
         raise ArchiveError(f"Git stopped with an error: {detail}")
 
 
-def compress(archive, progress=None, rebuild=False, should_stop=None):
+def compress(archive, progress=None, rebuild=False, should_stop=None, scrub=False):
     # Compresses the archive: clears its history, so nothing old is kept for it, then packs everything into one
     # storage file. A rebuild redoes every match from scratch, for the smallest archive, then checks everything is
     # intact. Saves made meanwhile are safe: new files are only deleted by a later compression once they're 27
     # hours old and still unused, and the history is only replaced if nothing else changed it meanwhile.
+    # With scrub, every unused leftover is deleted at the end, however new, while saves in this ComfyUI wait;
+    # another program saving to the archive at that moment could lose what it saved.
     # Returns True if it ran, or False if another compression of this archive was already running.
     lock = compress_lock(archive)
     if not lock.acquire(blocking=False):
@@ -876,8 +878,48 @@ def compress(archive, progress=None, rebuild=False, should_stop=None):
         if rebuild:
             run_watched(archive, ["fsck", "--no-dangling", "--no-progress"], "Checking the archive...", progress,
                         should_stop, time.time())
+        if scrub:
+            # Saves wait for this, so none of their new files, not yet part of the archive, can be deleted with
+            # the leftovers.
+            with store_lock(archive):
+                run_watched(archive, ["prune", "--expire=now"], "Scrubbing leftover data...", progress, should_stop,
+                            time.time())
         if progress:
             progress("Rebuilt" if rebuild else "Compressed", 1.0)
+        return True
+    finally:
+        lock.release()
+
+
+def leftover_size(archive):
+    # How much leftover data is waiting to be removed: stored data no longer used by anything, which a compression
+    # only removes once it's 27 hours old. Git lists it without deleting anything. Returns (bytes, how many).
+    listed = run_git(archive, ["prune", "--dry-run", "--expire=now"]).decode("utf-8", errors="replace").split()
+    total = 0
+    count = 0
+    for word in listed:
+        if len(word) == 40 and all(char in "0123456789abcdef" for char in word):
+            try:
+                total += os.path.getsize(os.path.join(str(archive), "objects", word[:2], word[2:]))
+                count += 1
+            except OSError:
+                pass
+    return total, count
+
+
+def scrub(archive, progress=None, should_stop=None):
+    # Deletes all leftover data right away, however new. Saves in this ComfyUI wait while it runs, so none of their
+    # new data, not yet part of the archive, can be deleted with it; another program using the archive at that
+    # moment could lose what it saved. Returns True if it ran, or False if the archive was being compressed.
+    lock = compress_lock(archive)
+    if not lock.acquire(blocking=False):
+        return False
+    try:
+        with store_lock(archive):
+            run_watched(archive, ["prune", "--expire=now"], "Scrubbing leftover data...", progress, should_stop,
+                        time.time())
+        if progress:
+            progress("Scrubbed", 1.0)
         return True
     finally:
         lock.release()

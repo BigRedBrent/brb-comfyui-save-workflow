@@ -826,7 +826,7 @@ def place_extractor(archive, only_update=False):
 def save_failed(started, folder, json_name, text, zip_data, archive, output, error):
     # Archiving failed, so the files are saved to their folder instead, named the way they'd be stored, with
     # .archive added, like "2026-11-03_10-21-05 my_clip_00001.json.archive". They're stored later by retry_failed or
-    # the Retry Failed Archive button.
+    # the Retry Failed Archiving button.
     day, clock = archiving.stamp_parts(started)
     ending = os.path.splitext(json_name)[1]
     saved = False
@@ -957,7 +957,7 @@ _tasks = {}
 _tasks_lock = threading.Lock()
 
 
-def run_task(action, archive):
+def run_task(action, archive, scrub=False):
     output = output_folder()
     task = {
         "text": "Starting...", "fraction": None, "done": False, "error": None, "result": None, "archive": archive,
@@ -998,16 +998,32 @@ def run_task(action, archive):
     def work():
         task["thread"] = threading.get_native_id()
         try:
-            if action == "rebuild":
+            if action == "scrub":
                 size_before = archiving.archive_size(archive)
-                rebuild_started = time.time()
-                if not archiving.compress(archive, progress, rebuild=True, should_stop=should_stop):
+                scrub_started = time.time()
+                if not archiving.scrub(archive, progress, should_stop=should_stop):
                     raise archiving.ArchiveError(
                         "The archive is being compressed right now. Try again once that's done."
                     )
                 size_after = archiving.archive_size(archive)
                 task["result"] = (
-                    "The archive was rebuilt and checked, and everything in it is intact.\n\n"
+                    "The leftover data was scrubbed.\n\n"
+                    f"Time to scrub: {archiving.duration(time.time() - scrub_started)}\n\n"
+                    f"Archive size before scrub: {archiving.size_text(size_before)}\n"
+                    f"Archive size after scrub: {archiving.size_text(size_after)}"
+                )
+                return
+            if action == "rebuild":
+                size_before = archiving.archive_size(archive)
+                rebuild_started = time.time()
+                if not archiving.compress(archive, progress, rebuild=True, should_stop=should_stop, scrub=scrub):
+                    raise archiving.ArchiveError(
+                        "The archive is being compressed right now. Try again once that's done."
+                    )
+                size_after = archiving.archive_size(archive)
+                task["result"] = (
+                    "The archive was rebuilt and checked, and everything in it is intact."
+                    + (" Leftover data was scrubbed." if scrub else "") + "\n\n"
                     f"Time to rebuild: {archiving.duration(time.time() - rebuild_started)}\n\n"
                     f"Archive size before rebuild: {archiving.size_text(size_before)}\n"
                     f"Archive size after rebuild: {archiving.size_text(size_after)}"
@@ -1102,7 +1118,7 @@ def add_routes():
         except Exception:
             data = {}
         action = data.get("action")
-        if action not in ("create", "retry_failed", "archive_all", "rebuild"):
+        if action not in ("create", "retry_failed", "archive_all", "rebuild", "scrub"):
             return web.json_response({"error": "Unknown action."})
         archive = archive_folder_for(data.get("archive_path"))
         if action == "create":
@@ -1118,7 +1134,7 @@ def add_routes():
             archiving.open_archive(archive, create=False)
         except archiving.ArchiveError as error:
             return web.json_response({"error": str(error)})
-        return web.json_response({"task": run_task(action, archive)})
+        return web.json_response({"task": run_task(action, archive, scrub=action == "rebuild" and data.get("scrub") is True)})
 
     @routes.post("/brb_save_workflow/unlock")
     async def unlock_wildcards(request):
@@ -1132,6 +1148,30 @@ def add_routes():
         if same and release_lock() is not None:
             print(f"{LOG_PREFIX} The wildcard files were unlocked from the pop-up")
         return web.json_response({"ok": True})
+
+    @routes.post("/brb_save_workflow/leftovers")
+    async def leftovers(request):
+        # Sent by the Scrub Archive button first: how much leftover data there is to scrub.
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        archive = archive_folder_for(data.get("archive_path"))
+
+        def measure():
+            try:
+                archiving.open_archive(archive, create=False)
+                size, count = archiving.leftover_size(archive)
+                return {
+                    "bytes": size, "count": count, "size": archiving.size_text(size),
+                    "archive_size": archiving.size_text(archiving.archive_size(archive)),
+                }
+            except archiving.ArchiveError as error:
+                return {"error": str(error)}
+            except Exception as error:
+                return {"error": f"{type(error).__name__}: {error}"}
+
+        return web.json_response(await asyncio.to_thread(measure))
 
     @routes.post("/brb_save_workflow/keep_locked")
     async def keep_wildcards_locked(request):
