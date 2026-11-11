@@ -843,6 +843,18 @@ function purgeOption(prompt) {
 
 // A button's task: a pop-up showing its progress, then its result.
 async function runTask(node, action, options = {}) {
+    // With options.findOnly, for Purge Archive's check: the window has Cancel, which stops it at once, and when the
+    // check is done, the window closes and this resolves with what it found (null if it was cancelled or failed).
+    // Otherwise it resolves when its window is closed.
+    const findOnly = options.findOnly === true;
+    let resolveFound = () => {};
+    const found = new Promise((resolve) => {
+        resolveFound = resolve;
+    });
+    let resolveClosed = () => {};
+    const closed = new Promise((resolve) => {
+        resolveClosed = resolve;
+    });
     const archivePath = findWidget(node, "archive_path")?.value ?? ".workflows";
     let response;
     try {
@@ -867,10 +879,14 @@ async function runTask(node, action, options = {}) {
 
     const titles = {
         retry_failed: "Retry Failed Archiving", archive_all: "Archive All", rebuild: "Rebuild Archive",
-        purge: "Purge Archive",
+        purge: "Purge Archive", find_leftovers: "Purge Archive",
     };
     const title = titles[action] || "Save Workflow";
     const { holder, box, bar } = floatingPopup(title);
+    const closeWindow = () => {
+        holder.remove();
+        resolveClosed();
+    };
     const text = popupText("Starting...");
     box.appendChild(text);
     const track = document.createElement("div");
@@ -898,13 +914,27 @@ async function runTask(node, action, options = {}) {
     };
 
     // Abort stops the task. The window stays, with the button grayed out, until the task has actually stopped.
-    const abort = popupButton("Abort");
+    const abort = popupButton(findOnly ? "Cancel" : "Abort");
     const abortRow = buttonRow(abort, null);
     box.appendChild(abortRow);
     let finished = false;
     let closeConfirm = null;
     abort.addEventListener("click", async () => {
         if (abort.disabled) {
+            return;
+        }
+        if (findOnly) {
+            // Nothing has changed yet, so it stops without asking.
+            abort.disabled = true;
+            abort.textContent = "Canceling...";
+            abort.style.opacity = "0.45";
+            abort.style.cursor = "default";
+            try {
+                await api.fetchApi(`/brb_save_workflow/task/${response.task}/abort`, { method: "POST" });
+            } catch {
+                closeWindow();
+                resolveFound(null);
+            }
             return;
         }
         // One last chance to back out, in case Abort was clicked by accident.
@@ -963,8 +993,9 @@ async function runTask(node, action, options = {}) {
             text.textContent = timed ? timed[2] : status.text || "";
             text.style.textAlign = timed ? "center" : "left";
             showProgress(status.fraction);
-            // Asks for the latest status once a second.
-            setTimeout(poll, 1000);
+            // Asks for the latest status once a second; Purge Archive's check four times a second, so its prompt
+            // replaces the window as soon as it's done.
+            setTimeout(poll, findOnly ? 250 : 1000);
             return;
         }
         finished = true;
@@ -972,9 +1003,17 @@ async function runTask(node, action, options = {}) {
         closeConfirm?.();
         // Once an abort has finished, the window goes away.
         if (status.aborted) {
-            holder.remove();
+            closeWindow();
+            resolveFound(null);
             return;
         }
+        // Purge Archive's check: the window closes and its prompt takes over.
+        if (findOnly && !status.error) {
+            closeWindow();
+            resolveFound(status.data);
+            return;
+        }
+        resolveFound(null);
         // The result shows in the same window, wherever it was moved to, with OK to close it.
         abortRow.remove();
         track.remove();
@@ -983,9 +1022,10 @@ async function runTask(node, action, options = {}) {
         text.textContent = status.error ? `Stopped:\n${status.error}` : status.result || "Done.";
         const ok = popupButton("OK");
         box.appendChild(buttonRow(ok, null));
-        ok.addEventListener("click", () => holder.remove());
+        ok.addEventListener("click", closeWindow);
     };
-    setTimeout(poll, 300);
+    setTimeout(poll, findOnly ? 250 : 300);
+    return findOnly ? found : closed;
 }
 
 async function onArchiveButton(node, action) {
@@ -1015,21 +1055,9 @@ async function onArchiveButton(node, action) {
             return;
         }
     } else if (action === "purge") {
-        // First, how much there is to purge.
-        const archivePath = findWidget(node, "archive_path")?.value ?? ".workflows";
-        let found;
-        try {
-            found = await (await api.fetchApi("/brb_save_workflow/leftovers", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ archive_path: archivePath }),
-            })).json();
-        } catch {
-            messagePopup("Couldn't reach ComfyUI to check the archive. Make sure it's still running.");
-            return;
-        }
-        if (found.error) {
-            messagePopup(found.error);
+        // First, how much there is to purge, in a window that shows its status and can be cancelled.
+        const found = await runTask(node, "find_leftovers", { findOnly: true });
+        if (!found) {
             return;
         }
         if (!found.bytes) {
@@ -1083,7 +1111,21 @@ async function onArchiveButton(node, action) {
             return;
         }
     }
-    runTask(node, action, options);
+    await runTask(node, action, options);
+}
+
+// While a button's confirmations or task window are open, or one is about to open, other clicks on the archive
+// buttons are ignored, so a task can't be started twice by clicking again.
+let buttonsBusy = false;
+
+function onButtonClick(node, action) {
+    if (buttonsBusy) {
+        return;
+    }
+    buttonsBusy = true;
+    onArchiveButton(node, action).finally(() => {
+        buttonsBusy = false;
+    });
 }
 
 function addArchiveButtons(node) {
@@ -1092,7 +1134,7 @@ function addArchiveButtons(node) {
         if ((node.widgets || []).some((widget) => widget.archiveAction === action)) {
             continue;
         }
-        const widget = node.addWidget("button", label, null, () => onArchiveButton(node, action), { serialize: false });
+        const widget = node.addWidget("button", label, null, () => onButtonClick(node, action), { serialize: false });
         widget.serialize = false;
         widget.archiveAction = action;
     }

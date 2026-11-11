@@ -961,7 +961,7 @@ def run_task(action, archive, purge=False):
     output = output_folder()
     task = {
         "text": "Starting...", "fraction": None, "done": False, "error": None, "result": None, "archive": archive,
-        "abort": False, "aborted": False, "status": None, "thread": None,
+        "abort": False, "aborted": False, "status": None, "thread": None, "data": None,
     }
     should_stop = lambda: task["abort"]
 
@@ -998,6 +998,15 @@ def run_task(action, archive, purge=False):
     def work():
         task["thread"] = threading.get_native_id()
         try:
+            if action == "find_leftovers":
+                # The Purge Archive button's first step: how much leftover data there is, for its prompt.
+                size, count = archiving.leftover_size(archive, progress, should_stop=should_stop)
+                task["data"] = {
+                    "bytes": size, "count": count, "size": archiving.size_text(size),
+                    "archive_size": archiving.size_text(archiving.archive_size(archive)),
+                }
+                task["result"] = ""
+                return
             if action == "purge":
                 size_before = archiving.archive_size(archive)
                 purge_started = time.time()
@@ -1118,7 +1127,7 @@ def add_routes():
         except Exception:
             data = {}
         action = data.get("action")
-        if action not in ("create", "retry_failed", "archive_all", "rebuild", "purge"):
+        if action not in ("create", "retry_failed", "archive_all", "rebuild", "purge", "find_leftovers"):
             return web.json_response({"error": "Unknown action."})
         archive = archive_folder_for(data.get("archive_path"))
         if action == "create":
@@ -1148,30 +1157,6 @@ def add_routes():
         if same and release_lock() is not None:
             print(f"{LOG_PREFIX} The wildcard files were unlocked from the pop-up")
         return web.json_response({"ok": True})
-
-    @routes.post("/brb_save_workflow/leftovers")
-    async def leftovers(request):
-        # Sent by the Purge Archive button first: how much leftover data there is to purge.
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-        archive = archive_folder_for(data.get("archive_path"))
-
-        def measure():
-            try:
-                archiving.open_archive(archive, create=False)
-                size, count = archiving.leftover_size(archive)
-                return {
-                    "bytes": size, "count": count, "size": archiving.size_text(size),
-                    "archive_size": archiving.size_text(archiving.archive_size(archive)),
-                }
-            except archiving.ArchiveError as error:
-                return {"error": str(error)}
-            except Exception as error:
-                return {"error": f"{type(error).__name__}: {error}"}
-
-        return web.json_response(await asyncio.to_thread(measure))
 
     @routes.post("/brb_save_workflow/keep_locked")
     async def keep_wildcards_locked(request):
@@ -1217,7 +1202,7 @@ def add_routes():
                 # Each finished task is only reported once.
                 _tasks.pop(request.match_info["task_id"], None)
         return web.json_response(
-            {key: task[key] for key in ("text", "fraction", "done", "error", "result", "aborted", "status")}
+            {key: task[key] for key in ("text", "fraction", "done", "error", "result", "aborted", "status", "data")}
         )
 
     @routes.post("/brb_save_workflow/task/{task_id}/abort")

@@ -803,19 +803,23 @@ def stop_process(process):
     process.wait()
 
 
-def run_watched(archive, args, text, progress, should_stop, started):
+def run_watched(archive, args, text, progress, should_stop, started, capture=False):
     # Runs a long Git command, showing the time so far and whether Git is working or not responding (not using the
-    # processor for a while), and stopping it if asked.
+    # processor for a while), and stopping it if asked. With capture, returns what Git printed.
     process = subprocess.Popen(
         ["git", "--git-dir", str(archive)] + args,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         env=git_environment(),
         creationflags=NO_WINDOW,
     )
     error_output = []
+    output = []
     reader = threading.Thread(target=lambda: error_output.append(process.stderr.read()), daemon=True)
     reader.start()
+    if capture:
+        output_reader = threading.Thread(target=lambda: output.append(process.stdout.read()), daemon=True)
+        output_reader.start()
     last_cpu = None
     last_active = time.time()
     # Abort is checked four times a second, so it responds right away. Whether Git has finished and the status, like
@@ -837,10 +841,16 @@ def run_watched(archive, args, text, progress, should_stop, started):
                 reader.join(timeout=5)
                 raise Stopped("Stopped.")
             time.sleep(0.25)
+            # Finished: on to the next step right away, not at the next status check.
+            if process.poll() is not None:
+                break
     reader.join(timeout=5)
+    if capture:
+        output_reader.join(timeout=5)
     if process.returncode != 0:
         detail = b"".join(error_output).decode("utf-8", errors="replace").strip()
         raise ArchiveError(f"Git stopped with an error: {detail}")
+    return b"".join(output)
 
 
 def compress(archive, progress=None, rebuild=False, should_stop=None, purge=False):
@@ -891,10 +901,12 @@ def compress(archive, progress=None, rebuild=False, should_stop=None, purge=Fals
         lock.release()
 
 
-def leftover_size(archive):
+def leftover_size(archive, progress=None, should_stop=None):
     # How much leftover data is waiting to be removed: stored data no longer used by anything, which a compression
-    # only removes once it's 27 hours old. Git lists it without deleting anything. Returns (bytes, how many).
-    listed = run_git(archive, ["prune", "--dry-run", "--expire=now"]).decode("utf-8", errors="replace").split()
+    # only removes once it's 27 hours old. Git lists it without deleting anything, which can take a while on a big
+    # archive, so it shows its status and can be stopped. Returns (bytes, how many).
+    listed = run_watched(archive, ["prune", "--dry-run", "--expire=now"], "Looking for leftover data...", progress,
+                         should_stop, time.time(), capture=True).decode("utf-8", errors="replace").split()
     total = 0
     count = 0
     for word in listed:
